@@ -117,6 +117,13 @@ def run() -> None:
             with contextlib.suppress(FileNotFoundError):
                 old_log.unlink()
 
+        # A provider-scoped token is preferred over any generic registry token.
+        # Railway already accepts BOT_HOSTING_REGISTER_TOKEN as a registration token;
+        # the Bot-Hosting-specific Railway patch restricts that token to these 3 IDs.
+        provider_token = os.environ.get("BOT_HOSTING_REGISTER_TOKEN", "").strip()
+        if provider_token:
+            os.environ["REGISTRY_TOKEN"] = provider_token
+
         # Railway verifies Bot-Hosting country from the direct-IP record. Register
         # that record first so Default and Custom can inherit the same independent
         # Railway-side check during the very first registration pass.
