@@ -1,0 +1,21 @@
+name: verify-v2
+
+on:
+  push:
+    branches: [bot-hosting-v2]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m py_compile main.py main_v2.py bot_hosting_agent.py test_v2.py
+      - name: Run isolated Bot-Hosting v2 tests
+        run: python test_v2.py
