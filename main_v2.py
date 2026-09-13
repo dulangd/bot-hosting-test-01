@@ -117,10 +117,17 @@ def run() -> None:
             with contextlib.suppress(FileNotFoundError):
                 old_log.unlink()
 
+        # Railway verifies Bot-Hosting country from the direct-IP record. Register
+        # that record first so Default and Custom can inherit the same independent
+        # Railway-side check during the very first registration pass.
+        registry_endpoints = sorted(
+            endpoints,
+            key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
+        )
         agent_pid = start_agent(
             core.STATE_DIR,
             TRAFFIC_LOG,
-            endpoints,
+            registry_endpoints,
             close_fds=(lock.fileno(),),
         )
 
