@@ -22,10 +22,12 @@ PROVIDER = "bot-hosting"
 DEFAULT_CUSTOM_DOMAIN = "bth.richd.cc.cd"
 HEARTBEAT_DEFAULT = 600
 HTTP_TIMEOUT = 12
+# Preserve the historical Registry identities already used in production.
+# The direct-IP endpoint is additive; existing Default/Custom IDs are never renamed.
 NODE_IDS = {
-    "default": "bot-hosting-default-01",
+    "default": "bot-hosting-01",
     "ip": "bot-hosting-ip-01",
-    "custom": "bot-hosting-custom-01",
+    "custom": "bot-hosting-domain-01",
 }
 BASE_NAMES = {
     "default": "BotHosting-Default-01",
@@ -174,29 +176,25 @@ def _short_id(used: set[str]) -> str:
 
 
 def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
+    """Return the existing client identity for every ingress.
+
+    Registry identity and VLESS client identity are deliberately separate.
+    Bot-Hosting historically exposed the same working rust-reality client
+    through both the provider hostname and the custom domain. Reusing that
+    existing client preserves both working links while adding the direct-IP
+    Registry record. Any extra clients left by an earlier v2 experiment are
+    retained in the config, but are not required for the three ingress URIs.
+    """
     clients = config["inbounds"][0]["settings"]["clients"]
     if not clients:
         raise ValueError("rust-reality config contains no clients")
-    by_email = {str(c.get("email", "")): c for c in clients if isinstance(c, dict)}
-    used = {str(s).lower() for c in clients for s in c.get("shortIds", [])}
-    default_id = NODE_IDS["default"]
-    if default_id not in by_email:
-        first = clients[0]
-        old_email = str(first.get("email", "")).strip()
-        if not old_email or old_email.startswith("bot-hosting-"):
-            first["email"] = default_id
-        by_email[default_id] = first
-    flow = str(clients[0].get("flow", "xtls-rprx-vision"))
-    for kind in ("ip", "custom"):
-        label = NODE_IDS[kind]
-        if label not in by_email:
-            client = {
-                "id": str(uuid.uuid4()), "shortIds": [_short_id(used)],
-                "email": label, "flow": flow,
-            }
-            clients.append(client)
-            by_email[label] = client
-    return {kind: by_email[NODE_IDS[kind]] for kind in ("default", "ip", "custom")}
+    primary = clients[0]
+    if not isinstance(primary, dict) or not primary.get("id"):
+        raise ValueError("rust-reality primary client is invalid")
+    short_ids = primary.get("shortIds", [])
+    if not isinstance(short_ids, list) or not short_ids:
+        raise ValueError("rust-reality primary client has no shortIds")
+    return {kind: primary for kind in ("default", "ip", "custom")}
 
 
 def _authority(host: str) -> str:
