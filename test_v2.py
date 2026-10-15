@@ -41,11 +41,9 @@ def test_client_migration() -> None:
     old = json.loads(json.dumps(cfg["inbounds"][0]["settings"]["clients"][0]))
     clients = agent.ensure_endpoint_clients(cfg)
     all_clients = cfg["inbounds"][0]["settings"]["clients"]
-    assert len(all_clients) == 3
-    assert clients["default"]["id"] == old["id"]
-    assert clients["default"]["shortIds"][0] == old["shortIds"][0]
-    assert len({c["id"] for c in all_clients}) == 3
-    assert len({c["shortIds"][0] for c in all_clients}) == 3
+    assert len(all_clients) == 1
+    assert {clients[k]["id"] for k in ("default", "ip", "custom")} == {old["id"]}
+    assert {clients[k]["shortIds"][0] for k in ("default", "ip", "custom")} == {old["shortIds"][0]}
 
 
 def test_three_endpoint_links_and_names() -> None:
@@ -67,12 +65,12 @@ def test_three_endpoint_links_and_names() -> None:
         agent.discover_hosts = original
     assert [x["kind"] for x in eps] == ["default", "ip", "custom"]
     assert [x["node_id"] for x in eps] == [
-        "bot-hosting-default-01", "bot-hosting-ip-01", "bot-hosting-custom-01"
+        "bot-hosting-01", "bot-hosting-ip-01", "bot-hosting-domain-01"
     ]
     assert [x["name"] for x in eps] == [
         "FI-BotHosting-Default-01", "FI-BotHosting-IP-01", "FI-BotHosting-Custom-01"
     ]
-    assert len({x["uri"].split("@", 1)[0] for x in eps}) == 3
+    assert len({x["uri"].split("@", 1)[0] for x in eps}) == 1
     assert sum(1 for x in eps if x["traffic_owner"]) == 1
     assert next(x for x in eps if x["traffic_owner"])["kind"] == "default"
 
