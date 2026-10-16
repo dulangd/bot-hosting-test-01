@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import main as core
+import bot_hosting_core as core
 from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
