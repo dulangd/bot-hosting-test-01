@@ -1,17 +1,12 @@
 """Bot-Hosting v2 entrypoint.
 
-This intentionally imports the known-working ``main.py`` instead of replacing it.
-The rust-reality v1.6.1 binary, configuration generator, checksum verification,
-performance profile and original client identity remain the baseline.
-
-v2 adds only management-plane features:
-- three logical endpoints: default hostname, direct IPv4 and verified custom domain;
-- stable Registry identity per endpoint; reuse the persisted working VLESS client identity unless endpoint-specific clients already exist;
-- FI/XX country-prefixed remarks from two-source egress verification;
-- Railway registration/heartbeat in a tiny forked helper;
-- shared physical-instance traffic totals from rust-reality completion counters;
-- optional cover page only on a second port (never on the REALITY port);
-- no sensitive VLESS links in Console unless RR_SHOW_LINKS=1.
+The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
+- three independent Registry endpoint identities;
+- the persisted working VLESS/REALITY credential reused for all three endpoints;
+- independent endpoint heartbeat/re-registration;
+- one stable individual subscription URL containing all three endpoints;
+- one public TCP port shared by the subscription HTTP path and REALITY traffic;
+- shared physical-instance traffic ownership with no triple counting.
 """
 
 from __future__ import annotations
@@ -24,6 +19,7 @@ import signal
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 import main as core
 from bot_hosting_agent import (
@@ -102,7 +98,7 @@ def prepare_runtime_config(config: dict, public_port: int) -> int:
     runtime_port = pick_backend_port(public_port)
     runtime = json.loads(json.dumps(config))
     runtime["inbounds"][0]["port"] = runtime_port
-    data = (json.dumps(runtime, ensure_ascii=False, indent=2) + "\\n").encode()
+    data = (json.dumps(runtime, ensure_ascii=False, indent=2) + "\n").encode()
     core.atomic_write(RUNTIME_CONFIG, data)
     core.validate_config_file(RUNTIME_CONFIG, self_test=False)
     return runtime_port
@@ -116,10 +112,7 @@ def supervise_runtime(binary: Path, runtime_config: Path, environment: dict[str,
         stderr=None,
         env=environment,
     )
-    stopping = {"value": False}
-
     def forward_signal(signum: int, _frame: object) -> None:
-        stopping["value"] = True
         mux.close()
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
@@ -252,7 +245,7 @@ def run() -> None:
         )
         core.log(
             f"manager agent={'pid=' + str(agent_pid) if agent_pid else 'disabled'}; "
-            f"local_subscription={'ready' if sub_ready else 'disabled'}; "
+            "local_subscription=ready; "
             "sensitive links saved in private state files"
         )
 
