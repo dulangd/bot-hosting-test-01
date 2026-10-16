@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import threading
 import tempfile
+import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
@@ -104,8 +107,12 @@ def test_local_subscription_contains_all_three_endpoints() -> None:
     assert "65.108.103.151:25901" in lines[1]
     assert "bth.richd.cc.cd:25901" in lines[2]
 
-    url = agent.subscription_url("fi3.bot-hosting.net", 25902, "stable-token")
-    assert url == "http://fi3.bot-hosting.net:25902/sub64/stable-token"
+    url = agent.subscription_url("fi3.bot-hosting.net", 25901, "stable-token")
+    assert url == "http://fi3.bot-hosting.net:25901/sub64/stable-token"
+
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td)
+        assert agent.subscription_token(state_dir) == agent.subscription_token(state_dir)
 
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -129,11 +136,74 @@ def test_completion_traffic_parser() -> None:
         assert state["connections"] == 2
 
 
-def test_cover_never_reuses_proxy_port_contract() -> None:
-    # main_v2 passes the proxy port to the agent; the agent starts HTTP cover
-    # only when RR_COVER_PORT is valid AND different from endpoint port.
+def test_single_public_port_mux_serves_subscription_and_forwards_reality() -> None:
+    cfg = fake_config()
+    agent.ensure_endpoint_clients(cfg)
+    endpoints = [
+        {"kind": "default", "node_id": "bot-hosting-01", "name": "FI-BotHosting-Default-01",
+         "host": "fi3.bot-hosting.net", "port": 25901, "uri": "vless://default@fi3.bot-hosting.net:25901?x=1",
+         "traffic_scope": "shared-instance", "traffic_owner": True},
+        {"kind": "ip", "node_id": "bot-hosting-ip-01", "name": "FI-BotHosting-IP-01",
+         "host": "65.108.103.151", "port": 25901, "uri": "vless://default@65.108.103.151:25901?x=1",
+         "traffic_scope": "shared-instance", "traffic_owner": False},
+        {"kind": "custom", "node_id": "bot-hosting-domain-01", "name": "FI-BotHosting-Custom-01",
+         "host": "bth.richd.cc.cd", "port": 25901, "uri": "vless://default@bth.richd.cc.cd:25901?x=1",
+         "traffic_scope": "shared-instance", "traffic_owner": False},
+    ]
+
+    backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    backend.bind(("127.0.0.1", 0))
+    backend.listen(8)
+    backend_port = backend.getsockname()[1]
+
+    def backend_loop() -> None:
+        try:
+            for _ in range(1):
+                conn, _ = backend.accept()
+                with conn:
+                    data = conn.recv(4096)
+                    conn.sendall(data)
+        finally:
+            backend.close()
+
+    worker = threading.Thread(target=backend_loop, daemon=True)
+    worker.start()
+
+    mux_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    mux_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    mux_socket.bind(("127.0.0.1", 0))
+    mux_port = mux_socket.getsockname()[1]
+    mux_socket.close()
+
+    mux = agent.SubscriptionMux(mux_port, backend_port, endpoints, "stable-token")
+    try:
+        mux.start()
+
+        http = socket.create_connection(("127.0.0.1", mux_port), timeout=3)
+        with http:
+            http.sendall(b"GET /sub64/stable-token HTTP/1.1\\r\\nHost: fi3.bot-hosting.net\\r\\nConnection: close\\r\\n\\r\\n")
+            response = b""
+            while True:
+                chunk = http.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        body = response.split(b"\\r\\n\\r\\n", 1)[1].decode("ascii")
+        decoded = __import__("base64").b64decode(body).decode("utf-8")
+        assert decoded == "\\n".join(ep["uri"] for ep in endpoints) + "\\n"
+
+        reality = socket.create_connection(("127.0.0.1", mux_port), timeout=3)
+        with reality:
+            marker = b"\\x16\\x03\\x01\\x00\\x10"
+            reality.sendall(marker)
+            assert reality.recv(len(marker)) == marker
+    finally:
+        mux.close()
+        worker.join(timeout=2)
+
     assert agent.HEARTBEAT_DEFAULT >= 60
-    assert agent.NODE_IDS["default"] != agent.NODE_IDS["ip"] != agent.NODE_IDS["custom"]
+    assert len({agent.NODE_IDS["default"], agent.NODE_IDS["ip"], agent.NODE_IDS["custom"]}) == 3
 
 
 def test_private_bounded_log_shape() -> None:
