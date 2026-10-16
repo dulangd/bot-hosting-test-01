@@ -226,6 +226,6 @@ if __name__ == "__main__":
     test_three_endpoint_links_and_names()
     test_local_subscription_contains_all_three_endpoints()
     test_completion_traffic_parser()
-    test_cover_never_reuses_proxy_port_contract()
+    test_single_public_port_mux_serves_subscription_and_forwards_reality()
     test_private_bounded_log_shape()
     print("PASS Bot-Hosting v2 isolated tests")
