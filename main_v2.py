@@ -6,7 +6,7 @@ performance profile and original client identity remain the baseline.
 
 v2 adds only management-plane features:
 - three logical endpoints: default hostname, direct IPv4 and verified custom domain;
-- unique VLESS identity per endpoint while preserving the old identity as default;
+- stable Registry identity per endpoint; reuse the persisted working VLESS client identity unless endpoint-specific clients already exist;
 - FI/XX country-prefixed remarks from two-source egress verification;
 - Railway registration/heartbeat in a tiny forked helper;
 - shared physical-instance traffic totals from rust-reality completion counters;
@@ -91,7 +91,7 @@ def run() -> None:
         core.install_binary()
         meta = core.load_or_create_node(port)
 
-        # Preserve the existing client as Default and append IP/Custom identities.
+        # Preserve the persisted working client identity; Registry endpoint IDs remain independent.
         config = json.loads(core.CONFIG.read_text("utf-8"))
         ensure_endpoint_clients(config)
         configure_private_traffic_log(config)
