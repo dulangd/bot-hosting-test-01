@@ -175,13 +175,14 @@ def _short_id(used: set[str]) -> str:
             return value
 
 
-def _sync_routing_users(config: dict, clients: list[dict]) -> None:
-    """Keep rust-reality routing.users exactly aligned with inbound clients.
+def _sync_routing_users(config: dict, clients: list[dict], owner_uuid: str) -> None:
+    """Assign every inbound UUID exactly once in rust-reality routing policy.
 
-    rust-reality validates this as a one-to-one assignment: every UUID in the
-    VLESS inbound must occur exactly once in routing.users. Adding the stable
-    IP/custom endpoint clients therefore requires updating routing.users too.
-    Existing client UUIDs are never regenerated or replaced here.
+    ``routing.users`` is a list of policy-group objects, not a flat UUID list.
+    Each group has a ``userIds`` array. Endpoint expansion adds two clients to
+    the existing inbound, so the UUIDs must be synchronized into the existing
+    policy group without changing the established/default client identity or
+    its routing policy.
     """
     inbound_ids: list[str] = []
     seen: set[str] = set()
@@ -201,7 +202,47 @@ def _sync_routing_users(config: dict, clients: list[dict]) -> None:
     routing = config.setdefault("routing", {})
     if not isinstance(routing, dict):
         raise ValueError("rust-reality routing must be an object")
-    routing["users"] = inbound_ids
+
+    groups = routing.get("users")
+    if groups is None:
+        groups = []
+    if not isinstance(groups, list):
+        raise ValueError("rust-reality routing.users must be a list of policy groups")
+
+    owner = None
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError("rust-reality routing.users contains a non-object group")
+        user_ids = group.get("userIds", [])
+        if not isinstance(user_ids, list):
+            raise ValueError("rust-reality routing.users[].userIds must be a list")
+        if owner_uuid in {str(value).strip() for value in user_ids}:
+            owner = group
+            break
+
+    if owner is None and groups:
+        owner = groups[0]
+
+    if owner is None:
+        owner = {
+            "name": "default-users",
+            "userIds": [],
+            "defaultOutbound": "direct",
+            "rules": [],
+        }
+        groups.append(owner)
+
+    inbound_set = set(inbound_ids)
+    for group in groups:
+        current = group.get("userIds", [])
+        group["userIds"] = [
+            str(value).strip()
+            for value in current
+            if str(value).strip() in inbound_set
+        ]
+
+    owner["userIds"] = list(inbound_ids)
+    routing["users"] = [group for group in groups if group.get("userIds")]
 
 
 def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
@@ -228,7 +269,10 @@ def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
             clients.append(client)
             by_email[label] = client
 
-    _sync_routing_users(config, clients)
+    default_uuid = str(by_email[default_id].get("id", "")).strip()
+    if not default_uuid:
+        raise ValueError("default Bot-Hosting client has no UUID")
+    _sync_routing_users(config, clients, default_uuid)
     return {kind: by_email[NODE_IDS[kind]] for kind in ("default", "ip", "custom")}
 
 
