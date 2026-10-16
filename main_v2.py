@@ -27,6 +27,7 @@ from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
     ensure_endpoint_clients,
+    registry_proofs,
     start_agent,
     subscription_token,
     verified_country,
@@ -163,6 +164,8 @@ def run() -> None:
 
         geo = verified_country(core.STATE_DIR)
         country = str(geo.get("country", "XX")).upper()
+        os.environ["RR_GEO_IP"] = str(geo.get("egress_ip", "")).strip()
+        os.environ["RR_GEO_COUNTRY"] = country
         endpoints = build_endpoints(config, meta, host, port, country)
         required_kinds = {"default", "ip", "custom"}
         actual_kinds = {ep["kind"] for ep in endpoints}
@@ -202,12 +205,15 @@ def run() -> None:
             key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
         )
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
+        proofs = registry_proofs(core.STATE_DIR, endpoints)
         backend_port = prepare_runtime_config(config, port)
         mux = SubscriptionMux(
             public_port=port,
             backend_port=backend_port,
             endpoints=endpoints,
             token=sub_token,
+            proofs=proofs,
+            geo=geo,
         )
         mux.start()
 
