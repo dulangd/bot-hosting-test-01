@@ -2,7 +2,8 @@
 
 The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
 - three independent Registry endpoint identities;
-- the persisted working VLESS/REALITY credential reused for all three endpoints;
+- the existing endpoint client identities are preserved; the historical default identity is not replaced;
+- additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
 - one stable individual subscription URL containing all three endpoints;
 - one public TCP port shared by the subscription HTTP path and REALITY traffic;
