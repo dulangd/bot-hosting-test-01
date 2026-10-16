@@ -27,6 +27,8 @@ from bot_hosting_agent import (
     build_endpoints,
     ensure_endpoint_clients,
     start_agent,
+    subscription_token,
+    subscription_url,
     verified_country,
 )
 
@@ -100,11 +102,17 @@ def run() -> None:
         geo = verified_country(core.STATE_DIR)
         country = str(geo.get("country", "XX")).upper()
         endpoints = build_endpoints(config, meta, host, port, country)
-        if not endpoints:
-            raise core.BootstrapError("no publishable Bot-Hosting endpoints discovered")
+        required_kinds = {"default", "ip", "custom"}
+        actual_kinds = {ep["kind"] for ep in endpoints}
+        if actual_kinds != required_kinds:
+            missing = ",".join(sorted(required_kinds - actual_kinds))
+            raise core.BootstrapError(
+                "Bot-Hosting v2 requires all 3 endpoints; "
+                f"missing={missing or 'unknown'}; refusing to start with a reduced node set"
+            )
 
         default_ep = next(
-            (ep for ep in endpoints if ep["kind"] == "default"), endpoints[0]
+            ep for ep in endpoints if ep["kind"] == "default"
         )
         core.atomic_write(core.CLIENT_LINK, (default_ep["uri"] + "\n").encode())
         core.atomic_write(
@@ -131,11 +139,36 @@ def run() -> None:
             endpoints,
             key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
         )
-        agent_pid = start_agent(
+        raw_sub_port = (
+            os.environ.get("RR_SUB_PORT")
+            or os.environ.get("RR_COVER_PORT")
+            or ""
+        ).strip()
+        subscription_port = None
+        if raw_sub_port:
+            try:
+                subscription_port = int(raw_sub_port)
+            except ValueError as exc:
+                raise core.BootstrapError(
+                    f"invalid RR_SUB_PORT/RR_COVER_PORT: {raw_sub_port!r}"
+                ) from exc
+            if not 1 <= subscription_port <= 65535:
+                raise core.BootstrapError(
+                    f"subscription port outside 1..65535: {subscription_port}"
+                )
+            if subscription_port == port:
+                raise core.BootstrapError(
+                    "RR_SUB_PORT/RR_COVER_PORT must be different from SERVER_PORT"
+                )
+
+        sub_token = subscription_token(core.STATE_DIR) if subscription_port else ""
+        agent_pid, sub_ready = start_agent(
             core.STATE_DIR,
             TRAFFIC_LOG,
             registry_endpoints,
             close_fds=(lock.fileno(),),
+            subscription_port=subscription_port,
+            subscription_token=sub_token,
         )
 
         core.log(
@@ -148,10 +181,28 @@ def run() -> None:
                 f"{ep['kind']}={ep['host']}:{ep['port']}" for ep in endpoints
             )
         )
-        if len(endpoints) < 3:
+        if sub_ready:
+            sub_host = (
+                os.environ.get("RR_SUB_HOST")
+                or host
+            ).strip().strip("[]")
+            sub_url = subscription_url(sub_host, subscription_port, sub_token)
+            print()
+            print("=" * 78)
+            print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (3 ENDPOINTS)")
+            print("Independent of Railway Registry")
+            print()
+            print("COPY THIS SUBSCRIPTION URL INTO v2rayN / Shadowrocket:")
+            print()
+            print(sub_url)
+            print()
+            print("Contains: default + direct-IP + custom-domain")
+            print("=" * 78)
+            print()
+        else:
             core.log(
-                "custom endpoint skipped: DNS did not verify against the "
-                "Bot-Hosting node; RR_CUSTOM_DOMAIN can override the candidate"
+                "local 3-endpoint subscription not exposed: set RR_SUB_PORT "
+                "(or RR_COVER_PORT) to a second published Bot-Hosting port"
             )
         core.log(
             "traffic scope=shared-instance; rust-reality v1.6.1 does not expose "
@@ -159,6 +210,7 @@ def run() -> None:
         )
         core.log(
             f"manager agent={'pid=' + str(agent_pid) if agent_pid else 'disabled'}; "
+            f"local_subscription={'ready' if sub_ready else 'disabled'}; "
             "sensitive links saved in private state files"
         )
 
