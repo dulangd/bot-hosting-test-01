@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import secrets
+import select
 import socket
 import threading
 import time
@@ -354,53 +355,198 @@ def subscription_url(host: str, port: int, token: str) -> str:
     return f"http://{_authority(host)}:{port}{SUBSCRIPTION_PATH}{urllib.parse.quote(token, safe='')}"
 
 
-def _http_server(port: int, endpoints: list[dict[str, Any]],
-                 proofs: dict[str, str], token: str) -> http.server.ThreadingHTTPServer:
-    raw, encoded = subscription_content(endpoints)
-    hashes = {k: hashlib.sha256(v.encode()).hexdigest() for k, v in proofs.items()}
-    expected = SUBSCRIPTION_PATH + token
-    raw_path = "/sub/" + token
+class SubscriptionMux:
+    """One public TCP port: HTTP subscription or raw REALITY passthrough.
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        server_version, sys_version = "nginx", ""
+    The free Bot-Hosting deployment exposes one published port. The mux owns
+    that single public port, serves the stable subscription path for HTTP
+    requests, and forwards every non-HTTP connection byte-for-byte to the
+    loopback rust-reality listener.
+    """
 
-        def log_message(self, *_args: Any) -> None:
+    def __init__(
+        self,
+        public_port: int,
+        backend_port: int,
+        endpoints: list[dict[str, Any]],
+        token: str,
+    ) -> None:
+        self.public_port = int(public_port)
+        self.backend_port = int(backend_port)
+        self.endpoints = endpoints
+        self.token = token
+        self.raw, self.encoded = subscription_content(endpoints)
+        self._sock: socket.socket | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def url(self) -> str:
+        host = os.environ.get("RR_SUB_HOST", "").strip().strip("[]")
+        if not host:
+            host = os.environ.get("RR_SERVER_ADDRESS", "").strip().strip("[]")
+        if not host:
+            host = "fi3.bot-hosting.net"
+        return subscription_url(host, self.public_port, self.token)
+
+    def start(self) -> None:
+        if self._sock is not None:
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.bind(("0.0.0.0", self.public_port))
+        sock.listen(128)
+        self._sock = sock
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="bot-hosting-subscription-mux",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    @staticmethod
+    def _is_http_prefix(data: bytes) -> bool:
+        return data.startswith(b"GET ") or data.startswith(b"HEAD ")
+
+    def _serve(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        while not self._stop.is_set():
+            try:
+                conn, _addr = sock.accept()
+            except OSError:
+                if self._stop.is_set():
+                    return
+                continue
+            threading.Thread(
+                target=self._handle,
+                args=(conn,),
+                name="bot-hosting-mux-conn",
+                daemon=True,
+            ).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(5.0)
+            first = conn.recv(8, socket.MSG_PEEK)
+            if self._is_http_prefix(first):
+                self._handle_http(conn)
+            else:
+                self._handle_reality(conn)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                conn.close()
+
+    def _handle_http(self, conn: socket.socket) -> None:
+        request = bytearray()
+        while b"\\r\\n\\r\\n" not in request and len(request) < 8192:
+            chunk = conn.recv(2048)
+            if not chunk:
+                return
+            request.extend(chunk)
+        if b"\\r\\n\\r\\n" not in request:
+            self._http_reply(conn, b"bad request\\n", "text/plain; charset=utf-8", 400)
             return
 
-        def _reply(self, body: bytes, ctype: str, status: int = 200) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        try:
+            line = bytes(request).split(b"\\r\\n", 1)[0].decode("ascii", "strict")
+            method, target, version = line.split(" ", 2)
+        except (UnicodeDecodeError, ValueError):
+            self._http_reply(conn, b"bad request\\n", "text/plain; charset=utf-8", 400)
+            return
 
-        def do_GET(self) -> None:  # noqa: N802
-            path = urllib.parse.urlparse(self.path).path
-            if path == expected:
-                self._reply(encoded.encode("ascii"), "text/plain; charset=utf-8")
-            elif path == raw_path:
-                self._reply(raw.encode("utf-8"), "text/plain; charset=utf-8")
-            elif path == "/health":
-                self._reply(
-                    json.dumps({
-                        "ok": True,
-                        "service": "bot-hosting-local-subscription",
-                        "endpoints": len(endpoints),
-                    }, separators=(",", ":")).encode(),
-                    "application/json",
-                )
-            elif path == "/.well-known/registry-proof":
-                self._reply(
-                    json.dumps({"proof_sha256": hashes}, separators=(",", ":")).encode(),
-                    "application/json",
-                )
-            else:
-                self._reply(b"not found", "text/plain; charset=utf-8", 404)
+        if version not in ("HTTP/1.0", "HTTP/1.1") or method not in ("GET", "HEAD"):
+            self._http_reply(conn, b"method not allowed\\n", "text/plain; charset=utf-8", 405)
+            return
 
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    server.daemon_threads = True
-    return server
+        path = urllib.parse.urlsplit(target).path
+        if path == f"{SUBSCRIPTION_PATH}{self.token}":
+            body = self.encoded.encode("ascii")
+            self._http_reply(conn, body, "text/plain; charset=utf-8", 200, head=(method == "HEAD"))
+            return
+
+        if path == "/health":
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "service": "bot-hosting-local-mux",
+                    "proxy_backend": self.backend_port,
+                    "endpoints": len(self.endpoints),
+                },
+                separators=(",", ":"),
+            ).encode()
+            self._http_reply(conn, body, "application/json", 200, head=(method == "HEAD"))
+            return
+
+        self._http_reply(conn, b"not found\\n", "text/plain; charset=utf-8", 404, head=(method == "HEAD"))
+
+    @staticmethod
+    def _http_reply(
+        conn: socket.socket,
+        body: bytes,
+        content_type: str,
+        status: int,
+        *,
+        head: bool = False,
+    ) -> None:
+        reason = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            405: "Method Not Allowed",
+        }.get(status, "Error")
+        headers = (
+            f"HTTP/1.1 {status} {reason}\\r\\n"
+            f"Content-Type: {content_type}\\r\\n"
+            "Cache-Control: no-store\\r\\n"
+            "Connection: close\\r\\n"
+            f"Content-Length: {len(body)}\\r\\n"
+            "\\r\\n"
+        ).encode("ascii")
+        conn.sendall(headers)
+        if not head:
+            conn.sendall(body)
+
+    def _handle_reality(self, client: socket.socket) -> None:
+        backend = socket.create_connection(("127.0.0.1", self.backend_port), timeout=8.0)
+        backend.settimeout(None)
+        client.settimeout(None)
+        sockets = [client, backend]
+        try:
+            while sockets and not self._stop.is_set():
+                readable, _writable, _exceptional = select.select(sockets, [], sockets, 60.0)
+                if _exceptional:
+                    return
+                if not readable:
+                    continue
+                for src in readable:
+                    data = src.recv(64 * 1024)
+                    if not data:
+                        return
+                    dst = backend if src is client else client
+                    dst.sendall(data)
+        finally:
+            with contextlib.suppress(OSError):
+                backend.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                backend.close()
+
+
 
 def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
                endpoints: list[dict[str, Any]],
@@ -469,22 +615,9 @@ def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
 
 
 def start_agent(state_dir: Path, log_path: Path, endpoints: list[dict[str, Any]], *,
-                close_fds: tuple[int, ...] = (),
-                subscription_port: int | None = None,
-                subscription_token: str = "") -> tuple[int | None, bool]:
+                close_fds: tuple[int, ...] = ()) -> int | None:
     if os.environ.get("RR_MANAGER_AGENT", "1") == "0" or not hasattr(os, "fork"):
-        return None, False
-
-    http_server = None
-    if subscription_port is not None:
-        if subscription_port == int(endpoints[0]["port"]):
-            raise ValueError("RR_SUB_PORT must be different from SERVER_PORT")
-        http_server = _http_server(
-            subscription_port,
-            endpoints,
-            _proofs(state_dir / "registry-proofs.json", endpoints),
-            subscription_token,
-        )
+        return None
 
     core_pid = os.getpid()
     pid = os.fork()
@@ -493,11 +626,7 @@ def start_agent(state_dir: Path, log_path: Path, endpoints: list[dict[str, Any]]
             with contextlib.suppress(OSError):
                 os.close(fd)
         try:
-            agent_loop(core_pid, state_dir, log_path, endpoints, http_server)
+            agent_loop(core_pid, state_dir, log_path, endpoints)
         finally:
             os._exit(0)
-
-    if http_server is not None:
-        with contextlib.suppress(Exception):
-            http_server.server_close()
-    return pid, http_server is not None
+    return pid
