@@ -54,19 +54,6 @@ def test_client_migration() -> None:
 def test_routing_users_tracks_all_endpoint_clients() -> None:
     cfg = fake_config()
     original_uuid = cfg["inbounds"][0]["settings"]["clients"][0]["id"]
-    # Simulate a stale routing.users list left by the original one-client config.
-    cfg["routing"]["users"] = [original_uuid]
-    clients = agent.ensure_endpoint_clients(cfg)
-    ids = [client["id"] for client in cfg["inbounds"][0]["settings"]["clients"]]
-    assert len(ids) == 3
-    assert len(set(ids)) == 3
-    assert cfg["routing"]["users"] == ids
-    assert cfg["routing"]["users"].count(original_uuid) == 1
-
-
-def test_routing_users_tracks_all_endpoint_clients() -> None:
-    cfg = fake_config()
-    original_uuid = cfg["inbounds"][0]["settings"]["clients"][0]["id"]
     # Simulate a stale one-client policy group from the original config.
     cfg["routing"]["users"] = [{
         "name": "default-users",
