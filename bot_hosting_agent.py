@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import http.server
@@ -34,6 +35,8 @@ BASE_NAMES = {
     "ip": "BotHosting-IP-01",
     "custom": "BotHosting-Custom-01",
 }
+SUBSCRIPTION_TOKEN_FILE = "subscription-token"
+SUBSCRIPTION_PATH = "/sub64/"
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -320,44 +323,99 @@ def _heartbeat(ep: dict, traffic: dict) -> int:
     return _http_json(base + "/api/v1/heartbeat", "POST", body, token)[0]
 
 
-def _cover(port: int, proofs: dict[str, str]) -> None:
+def subscription_token(state_dir: Path) -> str:
+    path = state_dir / SUBSCRIPTION_TOKEN_FILE
+    try:
+        value = path.read_text("utf-8").strip()
+        if len(value) >= 32 and all(ch.isalnum() or ch in "-_" for ch in value):
+            return value
+    except Exception:
+        pass
+    value = secrets.token_urlsafe(32)
+    path.write_text(value + "\n", "utf-8")
+    os.chmod(path, 0o600)
+    return value
+
+
+def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
+    by_kind = {ep["kind"]: ep for ep in endpoints}
+    missing = [kind for kind in ("default", "ip", "custom") if kind not in by_kind]
+    if missing:
+        raise ValueError(
+            "subscription requires all 3 Bot-Hosting endpoints; missing "
+            + ",".join(missing)
+        )
+    lines = [by_kind[kind]["uri"] for kind in ("default", "ip", "custom")]
+    raw = "\n".join(lines) + "\n"
+    return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def subscription_url(host: str, port: int, token: str) -> str:
+    return f"http://{_authority(host)}:{port}{SUBSCRIPTION_PATH}{urllib.parse.quote(token, safe='')}"
+
+
+def _http_server(port: int, endpoints: list[dict[str, Any]],
+                 proofs: dict[str, str], token: str) -> http.server.ThreadingHTTPServer:
+    raw, encoded = subscription_content(endpoints)
     hashes = {k: hashlib.sha256(v.encode()).hexdigest() for k, v in proofs.items()}
+    expected = SUBSCRIPTION_PATH + token
+    raw_path = "/sub/" + token
+
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version, sys_version = "nginx", ""
+
         def log_message(self, *_args: Any) -> None:
             return
-        def do_GET(self) -> None:  # noqa: N802
-            path = urllib.parse.urlparse(self.path).path
-            if path == "/health":
-                body, ctype = json.dumps({"ok": True, "service": "bot-hosting"}).encode(), "application/json"
-            elif path == "/.well-known/registry-proof":
-                body, ctype = json.dumps({"proof_sha256": hashes}).encode(), "application/json"
-            else:
-                body = b"<!doctype html><title>Service</title><h1>Service online</h1><p>This service is operating normally.</p>"
-                ctype = "text/html; charset=utf-8"
-            self.send_response(200)
+
+        def _reply(self, body: bytes, ctype: str, status: int = 200) -> None:
+            self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-    with contextlib.suppress(Exception):
-        http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever(1.0)
 
+        def do_GET(self) -> None:  # noqa: N802
+            path = urllib.parse.urlparse(self.path).path
+            if path == expected:
+                self._reply(encoded.encode("ascii"), "text/plain; charset=utf-8")
+            elif path == raw_path:
+                self._reply(raw.encode("utf-8"), "text/plain; charset=utf-8")
+            elif path == "/health":
+                self._reply(
+                    json.dumps({
+                        "ok": True,
+                        "service": "bot-hosting-local-subscription",
+                        "endpoints": len(endpoints),
+                    }, separators=(",", ":")).encode(),
+                    "application/json",
+                )
+            elif path == "/.well-known/registry-proof":
+                self._reply(
+                    json.dumps({"proof_sha256": hashes}, separators=(",", ":")).encode(),
+                    "application/json",
+                )
+            else:
+                self._reply(b"not found", "text/plain; charset=utf-8", 404)
+
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+    return server
 
 def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
-               endpoints: list[dict[str, Any]]) -> None:
+               endpoints: list[dict[str, Any]],
+               http_server: http.server.ThreadingHTTPServer | None = None) -> None:
     traffic_path, proof_path = state_dir / "traffic.json", state_dir / "registry-proofs.json"
     traffic = _read_json(traffic_path, _empty_traffic())
     if not isinstance(traffic, dict) or "tracking_since" not in traffic:
         traffic = _empty_traffic()
     proofs = _proofs(proof_path, endpoints)
-    raw_port = os.environ.get("RR_COVER_PORT", "").strip()
-    if raw_port:
-        with contextlib.suppress(Exception):
-            cover_port = int(raw_port)
-            if 1 <= cover_port <= 65535 and cover_port != int(endpoints[0]["port"]):
-                threading.Thread(target=_cover, args=(cover_port, proofs), daemon=True).start()
+    if http_server is not None:
+        threading.Thread(
+            target=http_server.serve_forever,
+            kwargs={"poll_interval": 1.0},
+            daemon=True,
+        ).start()
 
     heartbeat_s = max(60, int(os.environ.get("HEARTBEAT_SECONDS", HEARTBEAT_DEFAULT)))
     next_registry, next_save = time.monotonic() + 4, time.monotonic() + 15
@@ -411,9 +469,23 @@ def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
 
 
 def start_agent(state_dir: Path, log_path: Path, endpoints: list[dict[str, Any]], *,
-                close_fds: tuple[int, ...] = ()) -> int | None:
+                close_fds: tuple[int, ...] = (),
+                subscription_port: int | None = None,
+                subscription_token: str = "") -> tuple[int | None, bool]:
     if os.environ.get("RR_MANAGER_AGENT", "1") == "0" or not hasattr(os, "fork"):
-        return None
+        return None, False
+
+    http_server = None
+    if subscription_port is not None:
+        if subscription_port == int(endpoints[0]["port"]):
+            raise ValueError("RR_SUB_PORT must be different from SERVER_PORT")
+        http_server = _http_server(
+            subscription_port,
+            endpoints,
+            _proofs(state_dir / "registry-proofs.json", endpoints),
+            subscription_token,
+        )
+
     core_pid = os.getpid()
     pid = os.fork()
     if pid == 0:
@@ -421,7 +493,11 @@ def start_agent(state_dir: Path, log_path: Path, endpoints: list[dict[str, Any]]
             with contextlib.suppress(OSError):
                 os.close(fd)
         try:
-            agent_loop(core_pid, state_dir, log_path, endpoints)
+            agent_loop(core_pid, state_dir, log_path, endpoints, http_server)
         finally:
             os._exit(0)
-    return pid
+
+    if http_server is not None:
+        with contextlib.suppress(Exception):
+            http_server.server_close()
+    return pid, http_server is not None
