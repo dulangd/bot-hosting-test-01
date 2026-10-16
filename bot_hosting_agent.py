@@ -466,25 +466,25 @@ class SubscriptionMux:
 
     def _handle_http(self, conn: socket.socket) -> None:
         request = bytearray()
-        while b"\\r\\n\\r\\n" not in request and len(request) < 8192:
+        while b"\r\n\r\n" not in request and len(request) < 8192:
             chunk = conn.recv(2048)
             if not chunk:
                 return
             request.extend(chunk)
 
-        if b"\\r\\n\\r\\n" not in request:
-            self._http_reply(conn, b"bad request\\n", "text/plain; charset=utf-8", 400)
+        if b"\r\n\r\n" not in request:
+            self._http_reply(conn, b"bad request\n", "text/plain; charset=utf-8", 400)
             return
 
         try:
-            line = bytes(request).split(b"\\r\\n", 1)[0].decode("ascii", "strict")
+            line = bytes(request).split(b"\r\n", 1)[0].decode("ascii", "strict")
             method, target, version = line.split(" ", 2)
         except (UnicodeDecodeError, ValueError):
-            self._http_reply(conn, b"bad request\\n", "text/plain; charset=utf-8", 400)
+            self._http_reply(conn, b"bad request\n", "text/plain; charset=utf-8", 400)
             return
 
         if version not in ("HTTP/1.0", "HTTP/1.1") or method not in ("GET", "HEAD"):
-            self._http_reply(conn, b"method not allowed\\n", "text/plain; charset=utf-8", 405)
+            self._http_reply(conn, b"method not allowed\n", "text/plain; charset=utf-8", 405)
             return
 
         path = urllib.parse.urlsplit(target).path
@@ -506,7 +506,7 @@ class SubscriptionMux:
             self._http_reply(conn, body, "application/json", 200, head=(method == "HEAD"))
             return
 
-        self._http_reply(conn, b"not found\\n", "text/plain; charset=utf-8", 404, head=(method == "HEAD"))
+        self._http_reply(conn, b"not found\n", "text/plain; charset=utf-8", 404, head=(method == "HEAD"))
 
     @staticmethod
     def _http_reply(
@@ -524,12 +524,12 @@ class SubscriptionMux:
             405: "Method Not Allowed",
         }.get(status, "Error")
         headers = (
-            f"HTTP/1.1 {status} {reason}\\r\\n"
-            f"Content-Type: {content_type}\\r\\n"
-            "Cache-Control: no-store\\r\\n"
-            "Connection: close\\r\\n"
-            f"Content-Length: {len(body)}\\r\\n"
-            "\\r\\n"
+            f"HTTP/1.1 {status} {reason}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "\r\n"
         ).encode("ascii")
         conn.sendall(headers)
         if not head:
