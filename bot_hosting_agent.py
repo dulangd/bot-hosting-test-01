@@ -175,6 +175,35 @@ def _short_id(used: set[str]) -> str:
             return value
 
 
+def _sync_routing_users(config: dict, clients: list[dict]) -> None:
+    """Keep rust-reality routing.users exactly aligned with inbound clients.
+
+    rust-reality validates this as a one-to-one assignment: every UUID in the
+    VLESS inbound must occur exactly once in routing.users. Adding the stable
+    IP/custom endpoint clients therefore requires updating routing.users too.
+    Existing client UUIDs are never regenerated or replaced here.
+    """
+    inbound_ids: list[str] = []
+    seen: set[str] = set()
+    for client in clients:
+        if not isinstance(client, dict):
+            raise ValueError("rust-reality inbound contains a non-object client")
+        client_id = str(client.get("id", "")).strip()
+        if not client_id:
+            raise ValueError("rust-reality inbound contains a client without id")
+        if client_id in seen:
+            raise ValueError(
+                f"duplicate inbound client UUID cannot be routed exactly once: {client_id}"
+            )
+        seen.add(client_id)
+        inbound_ids.append(client_id)
+
+    routing = config.setdefault("routing", {})
+    if not isinstance(routing, dict):
+        raise ValueError("rust-reality routing must be an object")
+    routing["users"] = inbound_ids
+
+
 def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
     clients = config["inbounds"][0]["settings"]["clients"]
     if not clients:
@@ -198,6 +227,8 @@ def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
             }
             clients.append(client)
             by_email[label] = client
+
+    _sync_routing_users(config, clients)
     return {kind: by_email[NODE_IDS[kind]] for kind in ("default", "ip", "custom")}
 
 
