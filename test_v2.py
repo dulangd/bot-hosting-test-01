@@ -75,6 +75,38 @@ def test_three_endpoint_links_and_names() -> None:
     assert next(x for x in eps if x["traffic_owner"])["kind"] == "default"
 
 
+
+def test_local_subscription_contains_all_three_endpoints() -> None:
+    cfg = fake_config()
+    agent.ensure_endpoint_clients(cfg)
+    original = agent.discover_hosts
+    try:
+        agent.discover_hosts = lambda _host: {
+            "default": "fi3.bot-hosting.net",
+            "ip": "65.108.103.151",
+            "custom": "bth.richd.cc.cd",
+        }
+        eps = agent.build_endpoints(
+            cfg,
+            {"sni": "www.microsoft.com", "publicKey": "PUBLIC_KEY", "shortId": "0123456789abcdef"},
+            "fi3.bot-hosting.net", 25901, "FI",
+        )
+    finally:
+        agent.discover_hosts = original
+
+    raw, encoded = agent.subscription_content(eps)
+    decoded = __import__("base64").b64decode(encoded).decode("utf-8")
+    assert decoded == raw
+    lines = [line for line in decoded.splitlines() if line]
+    assert len(lines) == 3
+    assert all(line.startswith("vless://") for line in lines)
+    assert "fi3.bot-hosting.net:25901" in lines[0]
+    assert "65.108.103.151:25901" in lines[1]
+    assert "bth.richd.cc.cd:25901" in lines[2]
+
+    url = agent.subscription_url("fi3.bot-hosting.net", 25902, "stable-token")
+    assert url == "http://fi3.bot-hosting.net:25902/sub64/stable-token"
+
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "traffic.log"
@@ -122,6 +154,7 @@ def test_private_bounded_log_shape() -> None:
 if __name__ == "__main__":
     test_client_migration()
     test_three_endpoint_links_and_names()
+    test_local_subscription_contains_all_three_endpoints()
     test_completion_traffic_parser()
     test_cover_never_reuses_proxy_port_contract()
     test_private_bounded_log_shape()
