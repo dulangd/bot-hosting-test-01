@@ -44,9 +44,11 @@ def test_client_migration() -> None:
     old = json.loads(json.dumps(cfg["inbounds"][0]["settings"]["clients"][0]))
     clients = agent.ensure_endpoint_clients(cfg)
     all_clients = cfg["inbounds"][0]["settings"]["clients"]
-    assert len(all_clients) == 1
-    assert {clients[k]["id"] for k in ("default", "ip", "custom")} == {old["id"]}
-    assert {clients[k]["shortIds"][0] for k in ("default", "ip", "custom")} == {old["shortIds"][0]}
+    assert len(all_clients) == 3
+    assert clients["default"]["id"] == old["id"]
+    assert clients["default"]["shortIds"][0] == old["shortIds"][0]
+    assert len({clients[k]["id"] for k in ("default", "ip", "custom")}) == 3
+    assert len({clients[k]["shortIds"][0] for k in ("default", "ip", "custom")}) == 3
 
 
 def test_three_endpoint_links_and_names() -> None:
@@ -73,7 +75,7 @@ def test_three_endpoint_links_and_names() -> None:
     assert [x["name"] for x in eps] == [
         "FI-BotHosting-Default-01", "FI-BotHosting-IP-01", "FI-BotHosting-Custom-01"
     ]
-    assert len({x["uri"].split("@", 1)[0] for x in eps}) == 1
+    assert len({x["uri"].split("@", 1)[0] for x in eps}) == 3
     assert sum(1 for x in eps if x["traffic_owner"]) == 1
     assert next(x for x in eps if x["traffic_owner"])["kind"] == "default"
 
@@ -181,20 +183,20 @@ def test_single_public_port_mux_serves_subscription_and_forwards_reality() -> No
 
         http = socket.create_connection(("127.0.0.1", mux_port), timeout=3)
         with http:
-            http.sendall(b"GET /sub64/stable-token HTTP/1.1\\r\\nHost: fi3.bot-hosting.net\\r\\nConnection: close\\r\\n\\r\\n")
+            http.sendall(b"GET /sub64/stable-token HTTP/1.1\r\nHost: fi3.bot-hosting.net\r\nConnection: close\r\n\r\n")
             response = b""
             while True:
                 chunk = http.recv(4096)
                 if not chunk:
                     break
                 response += chunk
-        body = response.split(b"\\r\\n\\r\\n", 1)[1].decode("ascii")
+        body = response.split(b"\r\n\r\n", 1)[1].decode("ascii")
         decoded = __import__("base64").b64decode(body).decode("utf-8")
         assert decoded == "\n".join(ep["uri"] for ep in endpoints) + "\n"
 
         reality = socket.create_connection(("127.0.0.1", mux_port), timeout=3)
         with reality:
-            marker = b"\\x16\\x03\\x01\\x00\\x10"
+            marker = b"\x16\x03\x01\x00\x10"
             reality.sendall(marker)
             assert reality.recv(len(marker)) == marker
     finally:
