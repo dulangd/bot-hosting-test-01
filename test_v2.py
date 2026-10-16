@@ -110,9 +110,8 @@ def test_local_subscription_contains_all_three_endpoints() -> None:
     url = agent.subscription_url("fi3.bot-hosting.net", 25901, "stable-token")
     assert url == "http://fi3.bot-hosting.net:25901/sub64/stable-token"
 
-    with tempfile.TemporaryDirectory() as td:
-        state_dir = Path(td)
-        assert agent.subscription_token(state_dir) == agent.subscription_token(state_dir)
+    with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
+        assert agent.subscription_token(Path(td1), "stable-client-uuid") == agent.subscription_token(Path(td2), "stable-client-uuid")
 
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
