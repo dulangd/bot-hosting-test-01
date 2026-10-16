@@ -191,7 +191,7 @@ def test_single_public_port_mux_serves_subscription_and_forwards_reality() -> No
                 response += chunk
         body = response.split(b"\\r\\n\\r\\n", 1)[1].decode("ascii")
         decoded = __import__("base64").b64decode(body).decode("utf-8")
-        assert decoded == "\\n".join(ep["uri"] for ep in endpoints) + "\\n"
+        assert decoded == "\n".join(ep["uri"] for ep in endpoints) + "\n"
 
         reality = socket.create_connection(("127.0.0.1", mux_port), timeout=3)
         with reality:
