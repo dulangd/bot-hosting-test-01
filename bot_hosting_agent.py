@@ -324,7 +324,7 @@ def _heartbeat(ep: dict, traffic: dict) -> int:
     return _http_json(base + "/api/v1/heartbeat", "POST", body, token)[0]
 
 
-def subscription_token(state_dir: Path) -> str:
+def subscription_token(state_dir: Path, stable_identity: str = "") -> str:
     path = state_dir / SUBSCRIPTION_TOKEN_FILE
     try:
         value = path.read_text("utf-8").strip()
@@ -332,7 +332,15 @@ def subscription_token(state_dir: Path) -> str:
             return value
     except Exception:
         pass
-    value = secrets.token_urlsafe(32)
+
+    if stable_identity:
+        digest = hashlib.sha256(
+            ("bot-hosting-individual-subscription:" + stable_identity).encode("utf-8")
+        ).digest()
+        value = base64.urlsafe_b64encode(digest[:24]).decode("ascii").rstrip("=")
+    else:
+        value = secrets.token_urlsafe(32)
+
     path.write_text(value + "\n", "utf-8")
     os.chmod(path, 0o600)
     return value
@@ -518,115 +526,3 @@ class SubscriptionMux:
             f"Content-Length: {len(body)}\\r\\n"
             "\\r\\n"
         ).encode("ascii")
-        conn.sendall(headers)
-        if not head:
-            conn.sendall(body)
-
-    def _handle_reality(self, client: socket.socket) -> None:
-        backend = socket.create_connection(("127.0.0.1", self.backend_port), timeout=8.0)
-        backend.settimeout(None)
-        client.settimeout(None)
-        sockets = [client, backend]
-        try:
-            while sockets and not self._stop.is_set():
-                readable, _writable, _exceptional = select.select(sockets, [], sockets, 60.0)
-                if _exceptional:
-                    return
-                if not readable:
-                    continue
-                for src in readable:
-                    data = src.recv(64 * 1024)
-                    if not data:
-                        return
-                    dst = backend if src is client else client
-                    dst.sendall(data)
-        finally:
-            with contextlib.suppress(OSError):
-                backend.shutdown(socket.SHUT_RDWR)
-            with contextlib.suppress(OSError):
-                backend.close()
-
-
-
-def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
-               endpoints: list[dict[str, Any]],
-               http_server: http.server.ThreadingHTTPServer | None = None) -> None:
-    traffic_path, proof_path = state_dir / "traffic.json", state_dir / "registry-proofs.json"
-    traffic = _read_json(traffic_path, _empty_traffic())
-    if not isinstance(traffic, dict) or "tracking_since" not in traffic:
-        traffic = _empty_traffic()
-    proofs = _proofs(proof_path, endpoints)
-    if http_server is not None:
-        threading.Thread(
-            target=http_server.serve_forever,
-            kwargs={"poll_interval": 1.0},
-            daemon=True,
-        ).start()
-
-    heartbeat_s = max(60, int(os.environ.get("HEARTBEAT_SECONDS", HEARTBEAT_DEFAULT)))
-    next_registry, next_save = time.monotonic() + 4, time.monotonic() + 15
-    # Track each public endpoint independently. A failure on one endpoint must
-    # not force the other working endpoint records through unnecessary re-registers.
-    registered = {ep["node_id"]: False for ep in endpoints}
-    last_error, offset = "", 0
-    while os.getppid() == core_pid:
-        offset = _consume_log(log_path, offset, traffic)
-        now = time.monotonic()
-        if now >= next_save:
-            traffic["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            _atomic_json(traffic_path, _traffic(traffic))
-            next_save = now + 15
-        if now >= next_registry:
-            token = os.environ.get("REGISTRY_TOKEN", "").strip()
-            errors = []
-            for ep in endpoints:
-                node_id = ep["node_id"]
-                try:
-                    if token and registered.get(node_id, False):
-                        status = _heartbeat(ep, traffic)
-                    else:
-                        status = _register(ep, traffic, proofs)
-
-                    if 200 <= status < 300:
-                        if not registered.get(node_id, False):
-                            print(
-                                f"[registry] {node_id} registered mode={'bearer' if token else 'public-proof'}",
-                                flush=True,
-                            )
-                        registered[node_id] = True
-                    else:
-                        registered[node_id] = False
-                        errors.append(f"{node_id} HTTP {status}")
-                except Exception as exc:
-                    registered[node_id] = False
-                    errors.append(f"{node_id} {type(exc).__name__}")
-
-            if errors:
-                message = "; ".join(errors)
-                if message != last_error:
-                    print(f"[registry] registration/heartbeat issue: {message}", flush=True)
-                    last_error = message
-            else:
-                last_error = ""
-            next_registry = now + heartbeat_s
-        time.sleep(0.5)
-    with contextlib.suppress(Exception):
-        _atomic_json(traffic_path, _traffic(traffic))
-
-
-def start_agent(state_dir: Path, log_path: Path, endpoints: list[dict[str, Any]], *,
-                close_fds: tuple[int, ...] = ()) -> int | None:
-    if os.environ.get("RR_MANAGER_AGENT", "1") == "0" or not hasattr(os, "fork"):
-        return None
-
-    core_pid = os.getpid()
-    pid = os.fork()
-    if pid == 0:
-        for fd in close_fds:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        try:
-            agent_loop(core_pid, state_dir, log_path, endpoints)
-        finally:
-            os._exit(0)
-    return pid
