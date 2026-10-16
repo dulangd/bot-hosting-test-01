@@ -294,6 +294,10 @@ def _proofs(path: Path, endpoints: list[dict]) -> dict[str, str]:
     return values
 
 
+def registry_proofs(state_dir: Path, endpoints: list[dict]) -> dict[str, str]:
+    return _proofs(state_dir / "registry-proofs.json", endpoints)
+
+
 def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
     base = (os.environ.get("REGISTRY_URL") or REGISTRY_URL_DEFAULT).rstrip("/")
     token = os.environ.get("REGISTRY_TOKEN", "").strip()
