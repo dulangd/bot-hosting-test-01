@@ -20,15 +20,18 @@ import contextlib
 import fcntl
 import json
 import os
+import signal
+import socket
+import subprocess
 import sys
 
 import main as core
 from bot_hosting_agent import (
+    SubscriptionMux,
     build_endpoints,
     ensure_endpoint_clients,
     start_agent,
     subscription_token,
-    subscription_url,
     verified_country,
 )
 
@@ -69,6 +72,71 @@ def save_config(config: dict) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
     core.atomic_write(core.CONFIG, data)
+
+
+RUNTIME_CONFIG = core.STATE_DIR / "runtime-config.json"
+
+
+def pick_backend_port(public_port: int) -> int:
+    """Pick a loopback-only backend port not equal to the one Bot-Hosting publishes."""
+    start = max(20000, public_port + 1)
+    candidates = list(range(start, min(start + 256, 65535)))
+    # Also try a deterministic high range if SERVER_PORT is already high.
+    candidates += list(range(45000, min(45256, 65535)))
+    for candidate in candidates:
+        if candidate == public_port:
+            continue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", candidate))
+            return candidate
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    raise core.BootstrapError("could not reserve an internal rust-reality backend port")
+
+
+def prepare_runtime_config(config: dict, public_port: int) -> int:
+    runtime_port = pick_backend_port(public_port)
+    runtime = json.loads(json.dumps(config))
+    runtime["inbounds"][0]["port"] = runtime_port
+    data = (json.dumps(runtime, ensure_ascii=False, indent=2) + "\\n").encode()
+    core.atomic_write(RUNTIME_CONFIG, data)
+    core.validate_config_file(RUNTIME_CONFIG, self_test=False)
+    return runtime_port
+
+
+def supervise_runtime(binary: Path, runtime_config: Path, environment: dict[str, str], mux: SubscriptionMux) -> int:
+    process = subprocess.Popen(
+        [str(binary), "serve", "--config", str(runtime_config)],
+        stdin=subprocess.DEVNULL,
+        stdout=None,
+        stderr=None,
+        env=environment,
+    )
+    stopping = {"value": False}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        stopping["value"] = True
+        mux.close()
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.send_signal(signum)
+
+    previous_term = signal.signal(signal.SIGTERM, forward_signal)
+    previous_int = signal.signal(signal.SIGINT, forward_signal)
+    try:
+        return process.wait()
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+        mux.close()
+        if process.poll() is None:
+            with contextlib.suppress(Exception):
+                process.terminate()
+                process.wait(timeout=3)
 
 
 def run() -> None:
@@ -139,36 +207,21 @@ def run() -> None:
             endpoints,
             key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
         )
-        raw_sub_port = (
-            os.environ.get("RR_SUB_PORT")
-            or os.environ.get("RR_COVER_PORT")
-            or ""
-        ).strip()
-        subscription_port = None
-        if raw_sub_port:
-            try:
-                subscription_port = int(raw_sub_port)
-            except ValueError as exc:
-                raise core.BootstrapError(
-                    f"invalid RR_SUB_PORT/RR_COVER_PORT: {raw_sub_port!r}"
-                ) from exc
-            if not 1 <= subscription_port <= 65535:
-                raise core.BootstrapError(
-                    f"subscription port outside 1..65535: {subscription_port}"
-                )
-            if subscription_port == port:
-                raise core.BootstrapError(
-                    "RR_SUB_PORT/RR_COVER_PORT must be different from SERVER_PORT"
-                )
+        sub_token = subscription_token(core.STATE_DIR)
+        backend_port = prepare_runtime_config(config, port)
+        mux = SubscriptionMux(
+            public_port=port,
+            backend_port=backend_port,
+            endpoints=endpoints,
+            token=sub_token,
+        )
+        mux.start()
 
-        sub_token = subscription_token(core.STATE_DIR) if subscription_port else ""
-        agent_pid, sub_ready = start_agent(
+        agent_pid = start_agent(
             core.STATE_DIR,
             TRAFFIC_LOG,
             registry_endpoints,
             close_fds=(lock.fileno(),),
-            subscription_port=subscription_port,
-            subscription_token=sub_token,
         )
 
         core.log(
@@ -181,29 +234,18 @@ def run() -> None:
                 f"{ep['kind']}={ep['host']}:{ep['port']}" for ep in endpoints
             )
         )
-        if sub_ready:
-            sub_host = (
-                os.environ.get("RR_SUB_HOST")
-                or host
-            ).strip().strip("[]")
-            sub_url = subscription_url(sub_host, subscription_port, sub_token)
-            print()
-            print("=" * 78)
-            print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (3 ENDPOINTS)")
-            print("Independent of Railway Registry")
-            print()
-            print("COPY THIS SUBSCRIPTION URL INTO v2rayN / Shadowrocket:")
-            print()
-            print(sub_url)
-            print()
-            print("Contains: default + direct-IP + custom-domain")
-            print("=" * 78)
-            print()
-        else:
-            core.log(
-                "local 3-endpoint subscription not exposed: set RR_SUB_PORT "
-                "(or RR_COVER_PORT) to a second published Bot-Hosting port"
-            )
+        print()
+        print("=" * 78)
+        print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (3 ENDPOINTS)")
+        print("Same public port as the existing REALITY endpoint; independent of Railway Registry")
+        print()
+        print("COPY THIS SINGLE SUBSCRIPTION URL INTO v2rayN / Shadowrocket:")
+        print()
+        print(mux.url)
+        print()
+        print("Contains exactly: default + direct-IP + custom-domain")
+        print("=" * 78)
+        print()
         core.log(
             "traffic scope=shared-instance; rust-reality v1.6.1 does not expose "
             "UUID on completion events, so per-endpoint bytes are not fabricated"
@@ -220,14 +262,20 @@ def run() -> None:
 
         environment = os.environ.copy()
         environment.setdefault("RUST_BACKTRACE", "0")
-        core.log("execve rust-reality; management helper remains out of data path")
+        core.log(
+            f"start rust-reality backend=127.0.0.1:{backend_port}; "
+            "public port is owned by the single-port subscription/REALITY mux"
+        )
         sys.stdout.flush()
         sys.stderr.flush()
 
-        os.execve(
+        return_code = supervise_runtime(
             core.BINARY,
-            [str(core.BINARY), "serve", "--config", str(core.CONFIG)],
+            RUNTIME_CONFIG,
             environment,
+            mux,
+        )
+        raise SystemExit(return_code if return_code >= 0 else 1
         )
 
 
