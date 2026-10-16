@@ -6,7 +6,7 @@ def _short_id(used: set[str]) -> str:
             return value
 
 
-def _sync_routing_users(config: dict, clients: list[dict]) -> None:
+def _sync_routing_users(config: dict, clients: list[dict], owner_uuid: str) -> None:
     """Assign every inbound UUID exactly once in rust-reality routing policy.
 
     ``routing.users`` is a list of policy-group objects, not a flat UUID list.
@@ -51,7 +51,7 @@ def _sync_routing_users(config: dict, clients: list[dict]) -> None:
         user_ids = group.get("userIds", [])
         if not isinstance(user_ids, list):
             raise ValueError("rust-reality routing.users[].userIds must be a list")
-        if NODE_IDS["default"] in {str(value).strip() for value in user_ids}:
+        if owner_uuid in {str(value).strip() for value in user_ids}:
             owner = group
             break
 
@@ -110,7 +110,10 @@ def ensure_endpoint_clients(config: dict) -> dict[str, dict]:
             clients.append(client)
             by_email[label] = client
 
-    _sync_routing_users(config, clients)
+    default_uuid = str(by_email[default_id].get("id", "")).strip()
+    if not default_uuid:
+        raise ValueError("default Bot-Hosting client has no UUID")
+    _sync_routing_users(config, clients, default_uuid)
     return {kind: by_email[NODE_IDS[kind]] for kind in ("default", "ip", "custom")}
 
 
