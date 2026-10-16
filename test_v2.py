@@ -74,7 +74,7 @@ def test_routing_users_tracks_all_endpoint_clients() -> None:
         "defaultOutbound": "direct",
         "rules": [],
     }]
-    clients = agent.ensure_endpoint_clients(cfg)
+    agent.ensure_endpoint_clients(cfg)
     ids = [client["id"] for client in cfg["inbounds"][0]["settings"]["clients"]]
     assert len(ids) == 3
     assert len(set(ids)) == 3
