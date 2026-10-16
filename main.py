@@ -1039,7 +1039,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        # Keep the Bot-Hosting panel startup file unchanged. By default the
+        # existing main.py now enters the additive registry/traffic wrapper.
+        # RR_LEGACY_SINGLE_ENDPOINT=1 restores the exact old single-link path.
+        if os.environ.get("RR_LEGACY_SINGLE_ENDPOINT", "0") == "1":
+            main()
+        else:
+            sys.modules.setdefault("main", sys.modules[__name__])
+            from main_v2 import run as run_managed
+            run_managed()
     except KeyboardInterrupt:
         raise SystemExit(130)
     except Exception as exc:
