@@ -390,14 +390,14 @@ class SubscriptionMux:
         backend_port: int,
         endpoints: list[dict[str, Any]],
         token: str,
-        proofs: dict[str, str],
+        proofs: dict[str, str] | None = None,
         geo: dict[str, Any] | None = None,
     ) -> None:
         self.public_port = int(public_port)
         self.backend_port = int(backend_port)
         self.endpoints = endpoints
         self.token = token
-        self.proofs = proofs
+        self.proofs = proofs if isinstance(proofs, dict) else {}
         self.geo = geo if isinstance(geo, dict) else {}
         self.raw, self.encoded = subscription_content(endpoints)
         self._sock: socket.socket | None = None
