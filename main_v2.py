@@ -200,7 +200,7 @@ def run() -> None:
             endpoints,
             key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
         )
-        sub_token = subscription_token(core.STATE_DIR)
+        sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
         backend_port = prepare_runtime_config(config, port)
         mux = SubscriptionMux(
             public_port=port,
