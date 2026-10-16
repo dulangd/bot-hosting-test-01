@@ -361,7 +361,10 @@ def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
 
     heartbeat_s = max(60, int(os.environ.get("HEARTBEAT_SECONDS", HEARTBEAT_DEFAULT)))
     next_registry, next_save = time.monotonic() + 4, time.monotonic() + 15
-    registered, last_error, offset = False, "", 0
+    # Track each public endpoint independently. A failure on one endpoint must
+    # not force the other working endpoint records through unnecessary re-registers.
+    registered = {ep["node_id"]: False for ep in endpoints}
+    last_error, offset = "", 0
     while os.getppid() == core_pid:
         offset = _consume_log(log_path, offset, traffic)
         now = time.monotonic()
@@ -373,22 +376,34 @@ def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
             token = os.environ.get("REGISTRY_TOKEN", "").strip()
             errors = []
             for ep in endpoints:
+                node_id = ep["node_id"]
                 try:
-                    status = _heartbeat(ep, traffic) if token and registered else _register(ep, traffic, proofs)
-                    if not 200 <= status < 300:
-                        errors.append(f"{ep['node_id']} HTTP {status}")
+                    if token and registered.get(node_id, False):
+                        status = _heartbeat(ep, traffic)
+                    else:
+                        status = _register(ep, traffic, proofs)
+
+                    if 200 <= status < 300:
+                        if not registered.get(node_id, False):
+                            print(
+                                f"[registry] {node_id} registered mode={'bearer' if token else 'public-proof'}",
+                                flush=True,
+                            )
+                        registered[node_id] = True
+                    else:
+                        registered[node_id] = False
+                        errors.append(f"{node_id} HTTP {status}")
                 except Exception as exc:
-                    errors.append(f"{ep['node_id']} {type(exc).__name__}")
-            if not errors:
-                if not registered:
-                    print(f"[registry] {len(endpoints)}/{len(endpoints)} Bot-Hosting endpoints registered mode={'bearer' if token else 'public-proof'}", flush=True)
-                registered, last_error = True, ""
-            else:
+                    registered[node_id] = False
+                    errors.append(f"{node_id} {type(exc).__name__}")
+
+            if errors:
                 message = "; ".join(errors)
                 if message != last_error:
                     print(f"[registry] registration/heartbeat issue: {message}", flush=True)
                     last_error = message
-                registered = False
+            else:
+                last_error = ""
             next_registry = now + heartbeat_s
         time.sleep(0.5)
     with contextlib.suppress(Exception):
