@@ -369,6 +369,10 @@ def _proofs(path: Path, endpoints: list[dict]) -> dict[str, str]:
     return values
 
 
+def registry_proofs(state_dir: Path, endpoints: list[dict]) -> dict[str, str]:
+    return _proofs(state_dir / "registry-proofs.json", endpoints)
+
+
 def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
     base = (os.environ.get("REGISTRY_URL") or REGISTRY_URL_DEFAULT).rstrip("/")
     token = os.environ.get("REGISTRY_TOKEN", "").strip()
@@ -383,8 +387,11 @@ def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
     body.pop("kind", None)
     body["proof"] = proofs[ep["node_id"]]
     endpoint = os.environ.get("RR_REGISTRY_PROOF_ENDPOINT", "").strip()
-    if endpoint:
-        body["endpoint"] = endpoint
+    body["endpoint"] = endpoint or f"http://{_authority(ep['host'])}:{ep['port']}"
+    body["metadata"] = {
+        "egress_ip": str(os.environ.get("RR_GEO_IP", "")).strip(),
+        "country": str(os.environ.get("RR_GEO_COUNTRY", "")).strip().upper(),
+    }
     return _http_json(base + "/api/v1/register-public", "POST", body)[0]
 
 
@@ -458,11 +465,15 @@ class SubscriptionMux:
         backend_port: int,
         endpoints: list[dict[str, Any]],
         token: str,
+        proofs: dict[str, str] | None = None,
+        geo: dict[str, Any] | None = None,
     ) -> None:
         self.public_port = int(public_port)
         self.backend_port = int(backend_port)
         self.endpoints = endpoints
         self.token = token
+        self.proofs = proofs if isinstance(proofs, dict) else {}
+        self.geo = geo if isinstance(geo, dict) else {}
         self.raw, self.encoded = subscription_content(endpoints)
         self._sock: socket.socket | None = None
         self._stop = threading.Event()
@@ -569,13 +580,33 @@ class SubscriptionMux:
             self._http_reply(conn, body, "text/plain; charset=utf-8", 200, head=(method == "HEAD"))
             return
 
+        if path == "/.well-known/registry-proof":
+            body = json.dumps(
+                {
+                    "provider": "bot-hosting",
+                    "proof_sha256": {
+                        node_id: hashlib.sha256(str(proof).encode("utf-8")).hexdigest()
+                        for node_id, proof in self.proofs.items()
+                    },
+                },
+                separators=(",", ":"),
+            ).encode()
+            self._http_reply(conn, body, "application/json", 200, head=(method == "HEAD"))
+            return
+
         if path == "/health":
             body = json.dumps(
                 {
                     "ok": True,
                     "service": "bot-hosting-local-mux",
+                    "provider": "bot-hosting",
                     "proxy_backend": self.backend_port,
                     "endpoints": len(self.endpoints),
+                    "geo": {
+                        "country": str(self.geo.get("country", "XX")).upper(),
+                        "verified": bool(self.geo.get("verified")),
+                        "egress_ip": str(self.geo.get("egress_ip", "")),
+                    },
                 },
                 separators=(",", ":"),
             ).encode()
