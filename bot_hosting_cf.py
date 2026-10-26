@@ -534,9 +534,9 @@ def _start_cloudflared(state_dir: Path, host: str) -> CloudflaredProcess:
     if not token:
         raise RuntimeError("CF_TUNNEL_TOKEN missing")
     binary = _ensure_cloudflared(state_dir)
-    _log(f"CF_NAMED_TUNNEL_START host={host} protocol=auto")
+    _log(f"CF_NAMED_TUNNEL_START host={host} protocol=http2")
     process = subprocess.Popen(
-        [str(binary), "tunnel", "--no-autoupdate", "run", "--token", token],
+        [str(binary), "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token", token],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
