@@ -456,21 +456,31 @@ def ensure_cloudflared(state_dir: Path) -> Path:
     return path
 
 
-class QuickTunnel:
-    def __init__(self, state_dir: Path, local_port: int) -> None:
+class NamedTunnel:
+    def __init__(self, state_dir: Path, local_port: int, hostname: str, token: str) -> None:
         self.state_dir = state_dir
         self.local_port = int(local_port)
+        self.host = str(hostname or "").strip().lower()
+        self.token = str(token or "").strip()
         self.process: subprocess.Popen[str] | None = None
-        self.host = ""
         self._lines: queue.Queue[str] = queue.Queue()
         self._thread: threading.Thread | None = None
 
-    def start(self, timeout: float = 35.0) -> str:
+        if not self.host or "." not in self.host:
+            raise RuntimeError("CF_TUNNEL_HOSTNAME is missing or invalid")
+        if not self.token:
+            raise RuntimeError("CF_TUNNEL_TOKEN is missing")
+
+    def start(self, timeout: float = 40.0) -> str:
         binary = ensure_cloudflared(self.state_dir)
         self.process = subprocess.Popen(
             [
-                str(binary), "tunnel", "--no-autoupdate",
-                "--url", f"http://127.0.0.1:{self.local_port}",
+                str(binary),
+                "tunnel",
+                "--no-autoupdate",
+                "run",
+                "--token",
+                self.token,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -488,29 +498,33 @@ class QuickTunnel:
         self._thread.start()
 
         deadline = time.monotonic() + timeout
-        pattern = re.compile(r"https://([a-z0-9-]+\.trycloudflare\.com)", re.I)
+        registered = False
         last = ""
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError(f"cloudflared exited rc={self.process.returncode}: {last}")
+                raise RuntimeError(f"cloudflared named tunnel exited rc={self.process.returncode}: {last}")
             try:
                 line = self._lines.get(timeout=0.5)
             except queue.Empty:
-                continue
-            last = line
-            m = pattern.search(line)
-            if m:
-                self.host = m.group(1).lower()
-                self._wait_public_ready(self.host, timeout=max(5.0, deadline - time.monotonic()))
+                line = ""
+            if line:
+                last = line
+                if "Registered tunnel connection" in line:
+                    registered = True
+            if registered:
+                self._wait_public_ready(self.host, timeout=max(8.0, deadline - time.monotonic()))
                 return self.host
-        raise RuntimeError(f"cloudflared quick tunnel timeout: {last}")
 
-    def _wait_public_ready(self, host: str, timeout: float = 25.0) -> None:
+        raise RuntimeError(f"cloudflared named tunnel timeout before registration: {last}")
+
+    def _wait_public_ready(self, host: str, timeout: float = 30.0) -> None:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                raise RuntimeError(f"cloudflared exited rc={self.process.returncode} before public DNS ready")
+                raise RuntimeError(
+                    f"cloudflared exited rc={self.process.returncode} before public endpoint became ready"
+                )
             try:
                 socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
                 req = urllib.request.Request(
@@ -518,12 +532,18 @@ class QuickTunnel:
                     headers={"User-Agent": "bot-hosting-cf-readiness/1.0"},
                 )
                 with urllib.request.urlopen(req, timeout=5) as response:
+                    body = response.read(16384)
                     if int(response.status) == 200:
-                        return
+                        parsed = json.loads(body.decode("utf-8"))
+                        if (
+                            parsed.get("ok") is True
+                            and parsed.get("service") == "bot-hosting-cf-ws"
+                        ):
+                            return
             except Exception as exc:
                 last_error = exc
             time.sleep(0.5)
-        raise RuntimeError(f"Cloudflare quick tunnel public endpoint not ready: {last_error}")
+        raise RuntimeError(f"Cloudflare named tunnel public endpoint not ready: {last_error}")
 
     def close(self) -> None:
         proc, self.process = self.process, None
