@@ -229,6 +229,9 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
         mux.close()
         worker.join(timeout=2)
 
+    assert agent.HEARTBEAT_DEFAULT >= 60
+    assert len({agent.NODE_IDS["default"], agent.NODE_IDS["ip"], agent.NODE_IDS["custom"]}) == 3
+
 
 def test_runtime_config_keeps_reality_on_public_port() -> None:
     cfg = fake_config()
@@ -248,6 +251,21 @@ def test_runtime_config_keeps_reality_on_public_port() -> None:
     assert inbound["port"] == 25901
     assert inbound["listen"] == {"mode": "ipv4Only"}
     assert inbound["streamSettings"]["realitySettings"]["target"] == "127.0.0.1:25902"
+
+
+def test_private_bounded_log_shape() -> None:
+    cfg = fake_config()
+    old = os.environ.pop("RR_TRAFFIC_TRACKING", None)
+    try:
+        main_v2.configure_private_traffic_log(cfg)
+    finally:
+        if old is not None:
+            os.environ["RR_TRAFFIC_TRACKING"] = old
+    log = cfg["log"]
+    assert log["level"] == "debug"
+    assert log["output"] == "file"
+    assert log["file"]["maxFiles"] == 2
+    assert log["file"]["maxTotalBytes"] == 16 * 1024 * 1024
 
 
 if __name__ == "__main__":
