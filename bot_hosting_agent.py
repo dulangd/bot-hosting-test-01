@@ -376,7 +376,11 @@ def registry_proofs(state_dir: Path, endpoints: list[dict]) -> dict[str, str]:
 
 def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
     base = (os.environ.get("REGISTRY_URL") or REGISTRY_URL_DEFAULT).rstrip("/")
-    token = os.environ.get("REGISTRY_TOKEN", "").strip()
+    token = (
+        ""
+        if ep.get("force_public_proof")
+        else os.environ.get("REGISTRY_TOKEN", "").strip()
+    )
     body: dict[str, Any] = {
         "kind": "proxy", "node_id": ep["node_id"], "name": ep["name"],
         "provider": PROVIDER, "uri": ep["uri"], "priority": 80,
@@ -387,7 +391,9 @@ def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
         return _http_json(base + "/api/v1/register", "POST", body, token)[0]
     body.pop("kind", None)
     body["proof"] = proofs[ep["node_id"]]
-    endpoint = os.environ.get("RR_REGISTRY_PROOF_ENDPOINT", "").strip()
+    endpoint = str(ep.get("proof_endpoint") or "").strip()
+    if not endpoint:
+        endpoint = os.environ.get("RR_REGISTRY_PROOF_ENDPOINT", "").strip()
     body["endpoint"] = endpoint or f"http://{_authority(ep['host'])}:{ep['port']}"
     body["metadata"] = {
         "egress_ip": str(os.environ.get("RR_GEO_IP", "")).strip(),
@@ -397,7 +403,11 @@ def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
 
 
 def _heartbeat(ep: dict, traffic: dict) -> int:
-    token = os.environ.get("REGISTRY_TOKEN", "").strip()
+    token = (
+        ""
+        if ep.get("force_public_proof")
+        else os.environ.get("REGISTRY_TOKEN", "").strip()
+    )
     if not token:
         return 0
     base = (os.environ.get("REGISTRY_URL") or REGISTRY_URL_DEFAULT).rstrip("/")
@@ -441,7 +451,10 @@ def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
             "subscription requires all 3 Bot-Hosting endpoints; missing "
             + ",".join(missing)
         )
-    lines = [by_kind[kind]["uri"] for kind in ("default", "ip", "custom")]
+    order = ["default", "ip", "custom"]
+    if "cf" in by_kind:
+        order.append("cf")
+    lines = [by_kind[kind]["uri"] for kind in order]
     raw = "\n".join(lines) + "\n"
     return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
@@ -769,7 +782,14 @@ def agent_loop(core_pid: int, state_dir: Path, log_path: Path,
             errors = []
             for ep in endpoints:
                 try:
-                    status = _heartbeat(ep, traffic) if token and registered else _register(ep, traffic, proofs)
+                    use_heartbeat = bool(
+                        token and registered and not ep.get("force_public_proof")
+                    )
+                    status = (
+                        _heartbeat(ep, traffic)
+                        if use_heartbeat
+                        else _register(ep, traffic, proofs)
+                    )
                     if not 200 <= status < 300:
                         errors.append(f"{ep['node_id']} HTTP {status}")
                 except Exception as exc:

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
+import bot_hosting_cf as cf
 import main_v2
 
 
@@ -137,6 +138,62 @@ def test_local_subscription_contains_all_three_endpoints() -> None:
 
     with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
         assert agent.subscription_token(Path(td1), "stable-client-uuid") == agent.subscription_token(Path(td2), "stable-client-uuid")
+
+
+def test_cf_endpoint_is_fourth_and_persistent() -> None:
+    saved = {
+        key: os.environ.get(key)
+        for key in (
+            "CF_TUNNEL_TOKEN",
+            "CF_TUNNEL_HOSTNAME",
+            "BOT_HOSTING_CF_UUID",
+            "BOT_HOSTING_CF_WS_PATH",
+        )
+    }
+    try:
+        os.environ["CF_TUNNEL_TOKEN"] = "test-token"
+        os.environ["CF_TUNNEL_HOSTNAME"] = "bth-cf.k1.us.ci"
+        os.environ.pop("BOT_HOSTING_CF_UUID", None)
+        os.environ.pop("BOT_HOSTING_CF_WS_PATH", None)
+
+        with tempfile.TemporaryDirectory() as td:
+            prepared = cf.prepare_cf_endpoint(Path(td), "FI")
+            assert prepared is not None
+            endpoint, identity = prepared
+            prepared_again = cf.prepare_cf_endpoint(Path(td), "FI")
+            assert prepared_again is not None
+            endpoint_again, identity_again = prepared_again
+
+            assert identity_again == identity
+            assert endpoint_again["uri"] == endpoint["uri"]
+            assert endpoint["kind"] == "cf"
+            assert endpoint["node_id"] == "bot-hosting-cf-01"
+            assert endpoint["name"] == "FI-BotHosting-CF-01"
+            assert endpoint["host"] == "bth-cf.k1.us.ci"
+            assert endpoint["port"] == 443
+            assert endpoint["proof_endpoint"] == "https://bth-cf.k1.us.ci"
+            assert endpoint["force_public_proof"] is True
+            assert "security=tls" in endpoint["uri"]
+            assert "type=ws" in endpoint["uri"]
+
+            baseline = [
+                {"kind": "default", "uri": "vless://default"},
+                {"kind": "ip", "uri": "vless://ip"},
+                {"kind": "custom", "uri": "vless://custom"},
+            ]
+            raw, encoded = agent.subscription_content(baseline + [endpoint])
+            decoded = __import__("base64").b64decode(encoded).decode("utf-8")
+            assert decoded == raw
+            lines = decoded.splitlines()
+            assert lines[:3] == ["vless://default", "vless://ip", "vless://custom"]
+            assert lines[3] == endpoint["uri"]
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
 
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -272,6 +329,7 @@ if __name__ == "__main__":
     test_client_migration()
     test_three_endpoint_links_and_names()
     test_local_subscription_contains_all_three_endpoints()
+    test_cf_endpoint_is_fourth_and_persistent()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()

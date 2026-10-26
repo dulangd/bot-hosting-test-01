@@ -5,7 +5,7 @@ The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
 - the existing endpoint client identities are preserved; the historical default identity is not replaced;
 - additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
-- one stable individual subscription URL containing all three endpoints;
+- one stable individual subscription URL containing the three baseline REALITY endpoints and the optional CF Tunnel endpoint;
 - rust-reality owns the one public TCP port directly; subscription/proof HTTP uses its loopback cover fallback;
 - shared physical-instance traffic ownership with no triple counting.
 """
@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_core as core
+from bot_hosting_cf import CloudflareRuntime, prepare_cf_endpoint, start_cf_runtime
 from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
@@ -142,9 +143,18 @@ def wait_public_ready(process: subprocess.Popen, public_port: int, timeout: floa
     )
 
 
-def supervise_process(process: subprocess.Popen, mux: SubscriptionMux) -> int:
-    def forward_signal(signum: int, _frame: object) -> None:
+def supervise_process(
+    process: subprocess.Popen,
+    mux: SubscriptionMux,
+    cf_runtime: CloudflareRuntime | None = None,
+) -> int:
+    def close_sidecars() -> None:
         mux.close()
+        if cf_runtime is not None:
+            cf_runtime.close()
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        close_sidecars()
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 process.send_signal(signum)
@@ -156,7 +166,7 @@ def supervise_process(process: subprocess.Popen, mux: SubscriptionMux) -> int:
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
-        mux.close()
+        close_sidecars()
         if process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()
@@ -205,6 +215,38 @@ def run() -> None:
                 f"missing={missing or 'unknown'}; refusing to start with a reduced node set"
             )
 
+        cf_runtime: CloudflareRuntime | None = None
+        try:
+            cf_prepared = prepare_cf_endpoint(core.STATE_DIR, country)
+            if cf_prepared is None:
+                core.log(
+                    "CF endpoint disabled: CF_TUNNEL_TOKEN/CF_TUNNEL_HOSTNAME "
+                    "are not both configured"
+                )
+            else:
+                cf_ep, cf_identity = cf_prepared
+                cf_proofs = registry_proofs(core.STATE_DIR, endpoints + [cf_ep])
+                cf_runtime = start_cf_runtime(
+                    core.STATE_DIR,
+                    cf_identity,
+                    cf_proofs[cf_ep["node_id"]],
+                    cf_ep["host"],
+                )
+                endpoints.append(cf_ep)
+                core.log(
+                    f"CF endpoint activated: {cf_ep['name']}="
+                    f"{cf_ep['host']}:{cf_ep['port']} origin=127.0.0.1:25903"
+                )
+        except Exception as exc:
+            if cf_runtime is not None:
+                with contextlib.suppress(Exception):
+                    cf_runtime.close()
+            cf_runtime = None
+            core.log(
+                "CF endpoint not activated; existing 3 REALITY endpoints "
+                f"preserved: {type(exc).__name__}: {exc}"
+            )
+
         default_ep = next(
             ep for ep in endpoints if ep["kind"] == "default"
         )
@@ -231,7 +273,7 @@ def run() -> None:
         # Railway-side check during the very first registration pass.
         registry_endpoints = sorted(
             endpoints,
-            key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
+            key=lambda ep: {"ip": 0, "default": 1, "custom": 2, "cf": 3}.get(ep["kind"], 9),
         )
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
         proofs = registry_proofs(core.STATE_DIR, endpoints)
@@ -259,6 +301,9 @@ def run() -> None:
             wait_public_ready(process, port)
         except Exception:
             mux.close()
+            if cf_runtime is not None:
+                with contextlib.suppress(Exception):
+                    cf_runtime.close()
             with contextlib.suppress(Exception):
                 if "process" in locals() and process.poll() is None:
                     process.terminate()
@@ -284,14 +329,17 @@ def run() -> None:
         )
         print()
         print("=" * 78)
-        print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (3 ENDPOINTS)")
+        print(f"BOT-HOSTING INDIVIDUAL SUBSCRIPTION ({len(endpoints)} ENDPOINTS)")
         print("Same public port as the existing REALITY endpoint; independent of Railway Registry")
         print()
         print("COPY THIS SINGLE SUBSCRIPTION URL INTO v2rayN / Shadowrocket:")
         print()
         print(mux.url)
         print()
-        print("Contains exactly: default + direct-IP + custom-domain")
+        contains = "default + direct-IP + custom-domain"
+        if any(ep["kind"] == "cf" for ep in endpoints):
+            contains += " + CF-Tunnel"
+        print(f"Contains: {contains}")
         print("=" * 78)
         print()
         core.log(
@@ -315,7 +363,7 @@ def run() -> None:
         sys.stdout.flush()
         sys.stderr.flush()
 
-        return_code = supervise_process(process, mux)
+        return_code = supervise_process(process, mux, cf_runtime)
         raise SystemExit(return_code if return_code >= 0 else 1)
 
 
