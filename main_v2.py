@@ -6,7 +6,7 @@ The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
 - additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
 - one stable individual subscription URL containing all three endpoints;
-- one public TCP port shared by the subscription HTTP path and REALITY traffic;
+- rust-reality owns the one public TCP port directly; subscription/proof HTTP uses its loopback cover fallback;
 - shared physical-instance traffic ownership with no triple counting.
 """
 
@@ -76,11 +76,10 @@ def save_config(config: dict) -> None:
 RUNTIME_CONFIG = core.STATE_DIR / "runtime-config.json"
 
 
-def pick_backend_port(public_port: int) -> int:
-    """Pick a loopback-only backend port not equal to the one Bot-Hosting publishes."""
+def pick_dispatcher_port(public_port: int) -> int:
+    """Pick an internal loopback port for HTTP subscription + cover relay."""
     start = max(20000, public_port + 1)
     candidates = list(range(start, min(start + 256, 65535)))
-    # Also try a deterministic high range if SERVER_PORT is already high.
     candidates += list(range(45000, min(45256, 65535)))
     for candidate in candidates:
         if candidate == public_port:
@@ -88,27 +87,29 @@ def pick_backend_port(public_port: int) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", candidate))
+            sock.bind(("127.0.0.1", candidate))
             return candidate
         except OSError:
             pass
         finally:
             sock.close()
-    raise core.BootstrapError("could not reserve an internal rust-reality backend port")
+    raise core.BootstrapError("could not reserve an internal cover dispatcher port")
 
 
-def prepare_runtime_config(config: dict, public_port: int) -> int:
-    runtime_port = pick_backend_port(public_port)
+def prepare_runtime_config(
+    config: dict,
+    public_port: int,
+    dispatcher_port: int,
+) -> None:
     runtime = json.loads(json.dumps(config))
-    runtime["inbounds"][0]["port"] = runtime_port
-    runtime["inbounds"][0]["listen"] = {
-        "mode": "ipv4Only",
-        "ipv4": "127.0.0.1",
-    }
+    inbound = runtime["inbounds"][0]
+    inbound["port"] = public_port
+    inbound["listen"] = {"mode": "ipv4Only"}
+    reality = inbound["streamSettings"]["realitySettings"]
+    reality["target"] = f"127.0.0.1:{dispatcher_port}"
     data = (json.dumps(runtime, ensure_ascii=False, indent=2) + "\n").encode()
     core.atomic_write(RUNTIME_CONFIG, data)
     core.validate_config_file(RUNTIME_CONFIG, self_test=False)
-    return runtime_port
 
 
 def start_runtime(binary: Path, runtime_config: Path, environment: dict[str, str]) -> subprocess.Popen:
@@ -121,23 +122,23 @@ def start_runtime(binary: Path, runtime_config: Path, environment: dict[str, str
     )
 
 
-def wait_backend_ready(process: subprocess.Popen, backend_port: int, timeout: float = 8.0) -> None:
+def wait_public_ready(process: subprocess.Popen, public_port: int, timeout: float = 8.0) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise core.BootstrapError(
-                f"rust-reality exited before backend became ready rc={process.returncode}"
+                f"rust-reality exited before public listener became ready rc={process.returncode}"
             )
         try:
-            probe = socket.create_connection(("127.0.0.1", backend_port), timeout=0.5)
+            probe = socket.create_connection(("127.0.0.1", public_port), timeout=0.5)
             probe.close()
             return
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
     raise core.BootstrapError(
-        f"rust-reality backend 127.0.0.1:{backend_port} did not become ready: {last_error}"
+        f"rust-reality public listener 127.0.0.1:{public_port} did not become ready: {last_error}"
     )
 
 
@@ -234,25 +235,32 @@ def run() -> None:
         )
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
         proofs = registry_proofs(core.STATE_DIR, endpoints)
-        backend_port = prepare_runtime_config(config, port)
+        dispatcher_port = pick_dispatcher_port(port)
+        prepare_runtime_config(config, port, dispatcher_port)
         mux = SubscriptionMux(
             public_port=port,
-            backend_port=backend_port,
+            backend_port=dispatcher_port,
             endpoints=endpoints,
             token=sub_token,
             proofs=proofs,
             geo=geo,
+            cover_host=str(meta["sni"]),
+            cover_port=443,
         )
 
         environment = os.environ.copy()
         environment.setdefault("RUST_BACKTRACE", "0")
-        process = start_runtime(core.BINARY, RUNTIME_CONFIG, environment)
         try:
-            wait_backend_ready(process, backend_port)
+            # Start the loopback cover/subscription dispatcher first. rust-reality
+            # then owns SERVER_PORT directly and uses this dispatcher only as its
+            # cover target for HTTP fallbacks and real TLS cover handshakes.
             mux.start()
+            process = start_runtime(core.BINARY, RUNTIME_CONFIG, environment)
+            wait_public_ready(process, port)
         except Exception:
+            mux.close()
             with contextlib.suppress(Exception):
-                if process.poll() is None:
+                if "process" in locals() and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=3)
             raise
@@ -301,8 +309,8 @@ def run() -> None:
                 print(ep["uri"], flush=True)
 
         core.log(
-            f"rust-reality backend ready=127.0.0.1:{backend_port}; "
-            "public port=25901 mux ready"
+            f"rust-reality public listener ready=0.0.0.0:{port}; "
+            f"cover/subscription dispatcher=127.0.0.1:{dispatcher_port}"
         )
         sys.stdout.flush()
         sys.stderr.flush()
