@@ -35,10 +35,9 @@ from bot_hosting_agent import (
 )
 from bot_hosting_cf import (
     CloudflareWsServer,
-    QuickTunnel,
+    NamedTunnel,
     build_cf_endpoint,
     load_identity as load_cf_identity,
-    pick_loopback_port as pick_cf_loopback_port,
 )
 
 CLIENT_LINKS = core.STATE_DIR / "client-links.txt"
@@ -226,10 +225,14 @@ def run() -> None:
             )
 
         dispatcher_port = pick_dispatcher_port(port)
-        cf_port = pick_cf_loopback_port({port, dispatcher_port})
+        cf_port = int(os.environ.get("CF_LOCAL_PORT", "25903"))
+        if cf_port in {port, dispatcher_port}:
+            raise core.BootstrapError("CF_LOCAL_PORT conflicts with an existing Bot-Hosting listener")
+        cf_host = (os.environ.get("CF_TUNNEL_HOSTNAME") or "bth-cf.k1.us.ci").strip().lower()
+        cf_token = os.environ.get("CF_TUNNEL_TOKEN", "").strip()
         cf_identity = load_cf_identity(core.STATE_DIR)
         cf_server = CloudflareWsServer(cf_port, cf_identity, geo)
-        cf_tunnel = QuickTunnel(core.STATE_DIR, cf_port)
+        cf_tunnel = NamedTunnel(core.STATE_DIR, cf_port, cf_host, cf_token)
         try:
             cf_server.start()
             cf_host = cf_tunnel.start()
