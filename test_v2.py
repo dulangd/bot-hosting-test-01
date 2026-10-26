@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
-import bot_hosting_cf as cf
 import main_v2
 
 
@@ -140,41 +139,33 @@ def test_local_subscription_contains_all_three_endpoints() -> None:
         assert agent.subscription_token(Path(td1), "stable-client-uuid") == agent.subscription_token(Path(td2), "stable-client-uuid")
 
 
-def test_cf_endpoint_is_fourth_and_persistent() -> None:
+
+def test_ws_endpoint_is_fourth_and_persistent() -> None:
     saved = {
         key: os.environ.get(key)
-        for key in (
-            "CF_TUNNEL_TOKEN",
-            "CF_TUNNEL_HOSTNAME",
-            "BOT_HOSTING_CF_UUID",
-            "BOT_HOSTING_CF_WS_PATH",
-        )
+        for key in ("BOT_HOSTING_WS_UUID", "BOT_HOSTING_WS_PATH")
     }
     try:
-        os.environ["CF_TUNNEL_TOKEN"] = "test-token"
-        os.environ["CF_TUNNEL_HOSTNAME"] = "bth-cf.k1.us.ci"
-        os.environ.pop("BOT_HOSTING_CF_UUID", None)
-        os.environ.pop("BOT_HOSTING_CF_WS_PATH", None)
-
+        os.environ.pop("BOT_HOSTING_WS_UUID", None)
+        os.environ.pop("BOT_HOSTING_WS_PATH", None)
         with tempfile.TemporaryDirectory() as td:
-            prepared = cf.prepare_cf_endpoint(Path(td), "FI")
-            assert prepared is not None
-            endpoint, identity = prepared
-            prepared_again = cf.prepare_cf_endpoint(Path(td), "FI")
-            assert prepared_again is not None
-            endpoint_again, identity_again = prepared_again
-
-            assert identity_again == identity
-            assert endpoint_again["uri"] == endpoint["uri"]
-            assert endpoint["kind"] == "cf"
-            assert endpoint["node_id"] == "bot-hosting-cf-01"
-            assert endpoint["name"] == "FI-BotHosting-CF-01"
-            assert endpoint["host"] == "bth-cf.k1.us.ci"
-            assert endpoint["port"] == 443
-            assert endpoint["proof_endpoint"] == "https://bth-cf.k1.us.ci"
-            assert endpoint["force_public_proof"] is True
-            assert "security=tls" in endpoint["uri"]
+            endpoint, identity = agent.build_ws_endpoint(
+                Path(td), "fi3.bot-hosting.net", 25901, "FI"
+            )
+            endpoint2, identity2 = agent.build_ws_endpoint(
+                Path(td), "fi3.bot-hosting.net", 25901, "FI"
+            )
+            assert identity2 == identity
+            assert endpoint2["uri"] == endpoint["uri"]
+            assert endpoint["kind"] == "ws"
+            assert endpoint["node_id"] == "bot-hosting-ws-01"
+            assert endpoint["name"] == "FI-BotHosting-WS-01"
+            assert endpoint["host"] == "fi3.bot-hosting.net"
+            assert endpoint["port"] == 25901
+            assert "security=none" in endpoint["uri"]
             assert "type=ws" in endpoint["uri"]
+            assert endpoint["force_public_proof"] is True
+            assert endpoint["proof_endpoint"] == "http://fi3.bot-hosting.net:25901"
 
             baseline = [
                 {"kind": "default", "uri": "vless://default"},
@@ -193,6 +184,7 @@ def test_cf_endpoint_is_fourth_and_persistent() -> None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
 
 
 def test_completion_traffic_parser() -> None:
@@ -253,6 +245,10 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
     dispatcher_port = reserve.getsockname()[1]
     reserve.close()
 
+    ws_identity = {
+        "uuid": "22222222-2222-4222-8222-222222222222",
+        "ws_path": "/ws-test",
+    }
     mux = agent.SubscriptionMux(
         25901,
         dispatcher_port,
@@ -260,6 +256,7 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
         "stable-token",
         cover_host="127.0.0.1",
         cover_port=cover_port,
+        ws_identity=ws_identity,
     )
     try:
         mux.start()
@@ -276,6 +273,19 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
         body = response.split(b"\r\n\r\n", 1)[1].decode("ascii")
         decoded = __import__("base64").b64decode(body).decode("utf-8")
         assert decoded == "\n".join(ep["uri"] for ep in endpoints) + "\n"
+
+        ws = socket.create_connection(("127.0.0.1", dispatcher_port), timeout=3)
+        with ws:
+            ws.sendall(
+                b"GET /ws-test HTTP/1.1\r\n"
+                b"Host: fi3.bot-hosting.net\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                b"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            response = ws.recv(4096)
+            assert response.startswith(b"HTTP/1.1 101 Switching Protocols")
 
         tls = socket.create_connection(("127.0.0.1", dispatcher_port), timeout=3)
         with tls:
@@ -329,7 +339,7 @@ if __name__ == "__main__":
     test_client_migration()
     test_three_endpoint_links_and_names()
     test_local_subscription_contains_all_three_endpoints()
-    test_cf_endpoint_is_fourth_and_persistent()
+    test_ws_endpoint_is_fourth_and_persistent()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()

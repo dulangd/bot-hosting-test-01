@@ -10,6 +10,7 @@ import os
 import secrets
 import select
 import socket
+import struct
 import sys
 import threading
 import time
@@ -35,6 +36,10 @@ BASE_NAMES = {
     "ip": "BotHosting-IP-01",
     "custom": "BotHosting-Custom-01",
 }
+
+WS_NODE_ID = "bot-hosting-ws-01"
+WS_BASE_NAME = "BotHosting-WS-01"
+WS_IDENTITY_FILE = "ws-identity.json"
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -313,6 +318,300 @@ def build_endpoints(config: dict, meta: dict, default_host: str, port: int,
     return result
 
 
+
+def _normalize_ws_path(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        value = "/ws-" + secrets.token_urlsafe(12)
+    if not value.startswith("/"):
+        value = "/" + value
+    return value
+
+
+def load_ws_identity(state_dir: Path) -> dict[str, str]:
+    path = state_dir / WS_IDENTITY_FILE
+    old = _read_json(path, {})
+    if not isinstance(old, dict):
+        old = {}
+
+    candidate = (
+        os.environ.get("BOT_HOSTING_WS_UUID", "").strip()
+        or str(old.get("uuid", "")).strip()
+    )
+    try:
+        parsed = uuid.UUID(candidate) if candidate else uuid.uuid4()
+    except ValueError:
+        parsed = uuid.uuid4()
+    if parsed.version != 4:
+        parsed = uuid.uuid4()
+
+    identity = {
+        "uuid": str(parsed),
+        "ws_path": _normalize_ws_path(
+            os.environ.get("BOT_HOSTING_WS_PATH", "")
+            or str(old.get("ws_path", ""))
+        ),
+    }
+    _atomic_json(path, identity)
+    return identity
+
+
+def build_ws_endpoint(
+    state_dir: Path,
+    host: str,
+    port: int,
+    country: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    identity = load_ws_identity(state_dir)
+    cc = country if len(country) == 2 else "XX"
+    name = f"{cc}-{WS_BASE_NAME}"
+    query = urllib.parse.urlencode({
+        "encryption": "none",
+        "security": "none",
+        "type": "ws",
+        "path": identity["ws_path"],
+        "host": host,
+    })
+    endpoint = {
+        "kind": "ws",
+        "node_id": WS_NODE_ID,
+        "name": name,
+        "host": host,
+        "port": int(port),
+        "uri": (
+            f"vless://{identity['uuid']}@{_authority(host)}:{int(port)}"
+            f"?{query}#{urllib.parse.quote(name)}"
+        ),
+        "traffic_scope": "ws-fallback",
+        "traffic_owner": False,
+        "force_public_proof": True,
+        "proof_endpoint": f"http://{_authority(host)}:{int(port)}",
+    }
+    return endpoint, identity
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise EOFError("unexpected EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _ws_frame(payload: bytes, opcode: int = 2, *, masked: bool = False) -> bytes:
+    payload = bytes(payload)
+    first = 0x80 | (opcode & 0x0F)
+    mask_flag = 0x80 if masked else 0
+    length = len(payload)
+    if length < 126:
+        header = bytes([first, mask_flag | length])
+    elif length <= 0xFFFF:
+        header = bytes([first, mask_flag | 126]) + struct.pack("!H", length)
+    else:
+        header = bytes([first, mask_flag | 127]) + struct.pack("!Q", length)
+    if not masked:
+        return header + payload
+    mask = secrets.token_bytes(4)
+    body = bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+    return header + mask + body
+
+
+def _read_ws_frame(sock: socket.socket) -> tuple[int, bool, bytes]:
+    head = _recv_exact(sock, 2)
+    fin = bool(head[0] & 0x80)
+    opcode = head[0] & 0x0F
+    masked = bool(head[1] & 0x80)
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    if length > 8 * 1024 * 1024:
+        raise ValueError("websocket frame too large")
+    mask = _recv_exact(sock, 4) if masked else b""
+    payload = bytearray(_recv_exact(sock, int(length)))
+    if masked:
+        for index in range(len(payload)):
+            payload[index] ^= mask[index & 3]
+    return opcode, fin, bytes(payload)
+
+
+def _read_ws_message(sock: socket.socket) -> bytes | None:
+    parts: list[bytes] = []
+    started = False
+    while True:
+        opcode, fin, payload = _read_ws_frame(sock)
+        if opcode == 8:
+            return None
+        if opcode == 9:
+            sock.sendall(_ws_frame(payload, opcode=10))
+            continue
+        if opcode == 10:
+            continue
+        if opcode == 2:
+            parts = [payload]
+            started = True
+        elif opcode == 0 and started:
+            parts.append(payload)
+        else:
+            raise ValueError("unsupported websocket opcode")
+        if fin:
+            return b"".join(parts)
+
+
+def _parse_vless_request(data: bytes, expected_uuid: str) -> tuple[int, str, int, bytes]:
+    if len(data) < 24:
+        raise ValueError("short VLESS request")
+    index = 0
+    version = data[index]
+    index += 1
+    supplied = data[index:index + 16]
+    index += 16
+    if supplied != uuid.UUID(expected_uuid).bytes:
+        raise ValueError("VLESS authentication failed")
+    opt_len = data[index]
+    index += 1 + opt_len
+    if index + 4 > len(data):
+        raise ValueError("invalid VLESS request")
+    if data[index] != 1:
+        raise ValueError("only VLESS TCP CONNECT is supported")
+    index += 1
+    port = struct.unpack("!H", data[index:index + 2])[0]
+    index += 2
+    atyp = data[index]
+    index += 1
+    if atyp == 1:
+        if index + 4 > len(data):
+            raise ValueError("bad VLESS IPv4")
+        host = socket.inet_ntop(socket.AF_INET, data[index:index + 4])
+        index += 4
+    elif atyp == 2:
+        if index >= len(data):
+            raise ValueError("bad VLESS domain")
+        size = data[index]
+        index += 1
+        if not size or index + size > len(data):
+            raise ValueError("bad VLESS domain")
+        host = data[index:index + size].decode("idna")
+        index += size
+    elif atyp == 3:
+        if index + 16 > len(data):
+            raise ValueError("bad VLESS IPv6")
+        host = socket.inet_ntop(socket.AF_INET6, data[index:index + 16])
+        index += 16
+    else:
+        raise ValueError("unsupported VLESS address type")
+    return version, host, port, data[index:]
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _connect_public(host: str, port: int, timeout: float = 10.0) -> socket.socket:
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("target port outside 1..65535")
+    last_error: Exception | None = None
+    for family, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
+        host, int(port), type=socket.SOCK_STREAM
+    ):
+        if not _is_public_ip(str(sockaddr[0])):
+            continue
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sockaddr)
+            sock.settimeout(None)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            with contextlib.suppress(OSError):
+                sock.close()
+    raise OSError(f"no reachable public address for {host}:{port}: {last_error}")
+
+
+def ws_public_selftest(
+    public_port: int,
+    public_host: str,
+    identity: dict[str, str],
+    timeout: float = 10.0,
+) -> None:
+    sock = socket.create_connection(("127.0.0.1", int(public_port)), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        request = (
+            f"GET {identity['ws_path']} HTTP/1.1\r\n"
+            f"Host: {public_host}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response and len(response) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        status = bytes(response).split(b"\r\n", 1)[0]
+        if b" 101 " not in status:
+            raise RuntimeError(
+                "WS upgrade through public rust-reality fallback failed: "
+                + status.decode("ascii", "replace")
+            )
+
+        domain = b"example.com"
+        payload = (
+            bytes([0])
+            + uuid.UUID(identity["uuid"]).bytes
+            + bytes([0, 1])
+            + struct.pack("!H", 80)
+            + bytes([2, len(domain)])
+            + domain
+            + b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        )
+        sock.sendall(_ws_frame(payload, masked=True))
+        received = bytearray()
+        got_vless_header = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and len(received) < 256 * 1024:
+            opcode, _fin, frame = _read_ws_frame(sock)
+            if opcode == 8:
+                break
+            if opcode == 9:
+                sock.sendall(_ws_frame(frame, opcode=10, masked=True))
+                continue
+            if opcode != 2:
+                continue
+            if not got_vless_header:
+                if len(frame) < 2 or frame[0] != 0:
+                    raise RuntimeError("invalid VLESS WS response header")
+                frame = frame[2:]
+                got_vless_header = True
+            received.extend(frame)
+            if b"HTTP/" in received:
+                return
+        raise RuntimeError("WS VLESS self-test did not receive target HTTP response")
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
 def _empty_traffic() -> dict[str, Any]:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return {"version": 1, "name": "rust-reality-shared-instance", "tracking_since": now,
@@ -452,8 +751,8 @@ def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
             + ",".join(missing)
         )
     order = ["default", "ip", "custom"]
-    if "cf" in by_kind:
-        order.append("cf")
+    if "ws" in by_kind:
+        order.append("ws")
     lines = [by_kind[kind]["uri"] for kind in order]
     raw = "\n".join(lines) + "\n"
     return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")
@@ -482,6 +781,7 @@ class SubscriptionMux:
         geo: dict[str, Any] | None = None,
         cover_host: str = "",
         cover_port: int = 443,
+        ws_identity: dict[str, str] | None = None,
     ) -> None:
         self.public_port = int(public_port)
         self.backend_port = int(backend_port)
@@ -491,6 +791,7 @@ class SubscriptionMux:
         self.geo = geo if isinstance(geo, dict) else {}
         self.cover_host = str(cover_host).strip()
         self.cover_port = int(cover_port)
+        self.ws_identity = ws_identity if isinstance(ws_identity, dict) else None
         if not self.cover_host:
             raise ValueError("cover_host is required")
         if not 1 <= self.cover_port <= 65535:
@@ -499,6 +800,10 @@ class SubscriptionMux:
         self._sock: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def set_endpoints(self, endpoints: list[dict[str, Any]]) -> None:
+        self.endpoints = list(endpoints)
+        self.raw, self.encoded = subscription_content(self.endpoints)
 
     @property
     def url(self) -> str:
@@ -580,7 +885,7 @@ class SubscriptionMux:
                 self._handle_http(conn, initial)
             else:
                 self._handle_reality(conn, initial)
-        except (OSError, ValueError) as exc:
+        except (OSError, EOFError, ValueError, UnicodeError) as exc:
             print(f"[cover] connection error: {exc}", file=sys.stderr, flush=True)
         finally:
             with contextlib.suppress(OSError):
@@ -588,8 +893,8 @@ class SubscriptionMux:
 
     def _handle_http(self, conn: socket.socket, initial: bytes = b"") -> None:
         request = bytearray(initial)
-        while b"\r\n\r\n" not in request and len(request) < 8192:
-            chunk = conn.recv(2048)
+        while b"\r\n\r\n" not in request and len(request) < 65536:
+            chunk = conn.recv(4096)
             if not chunk:
                 return
             request.extend(chunk)
@@ -598,9 +903,10 @@ class SubscriptionMux:
             self._http_reply(conn, b"bad request\n", "text/plain; charset=utf-8", 400)
             return
 
+        header_blob, pending = bytes(request).split(b"\r\n\r\n", 1)
         try:
-            line = bytes(request).split(b"\r\n", 1)[0].decode("ascii", "strict")
-            method, target, version = line.split(" ", 2)
+            lines = header_blob.decode("iso-8859-1").split("\r\n")
+            method, target, version = lines[0].split(" ", 2)
         except (UnicodeDecodeError, ValueError):
             self._http_reply(conn, b"bad request\n", "text/plain; charset=utf-8", 400)
             return
@@ -609,7 +915,26 @@ class SubscriptionMux:
             self._http_reply(conn, b"method not allowed\n", "text/plain; charset=utf-8", 405)
             return
 
+        headers: dict[str, str] = {}
+        for raw_line in lines[1:]:
+            if ":" not in raw_line:
+                continue
+            key, value = raw_line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
         path = urllib.parse.urlsplit(target).path
+        ws_path = str((self.ws_identity or {}).get("ws_path", ""))
+        if (
+            method == "GET"
+            and ws_path
+            and path == ws_path
+            and headers.get("upgrade", "").lower() == "websocket"
+            and "upgrade" in headers.get("connection", "").lower()
+            and headers.get("sec-websocket-key")
+        ):
+            self._handle_ws(conn, headers, pending)
+            return
+
         if path == f"{SUBSCRIPTION_PATH}{self.token}":
             body = self.encoded.encode("ascii")
             self._http_reply(conn, body, "text/plain; charset=utf-8", 200, head=(method == "HEAD"))
@@ -639,6 +964,7 @@ class SubscriptionMux:
                     "public_port": self.public_port,
                     "cover_host": self.cover_host,
                     "endpoints": len(self.endpoints),
+                    "websocket": bool(self.ws_identity),
                     "geo": {
                         "country": str(self.geo.get("country", "XX")).upper(),
                         "verified": bool(self.geo.get("verified")),
@@ -651,6 +977,81 @@ class SubscriptionMux:
             return
 
         self._http_reply(conn, b"not found\n", "text/plain; charset=utf-8", 404, head=(method == "HEAD"))
+
+    def _handle_ws(
+        self,
+        conn: socket.socket,
+        headers: dict[str, str],
+        pending: bytes,
+    ) -> None:
+        identity = self.ws_identity
+        if not identity:
+            raise ValueError("WS identity is not configured")
+        key = headers.get("sec-websocket-key", "")
+        accept = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+        ).decode("ascii")
+        conn.sendall(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+        )
+        conn.settimeout(None)
+        if pending:
+            raise ValueError("unexpected websocket payload before upgrade completed")
+
+        first = _read_ws_message(conn)
+        if first is None:
+            return
+        version, host, port, payload = _parse_vless_request(
+            first, identity["uuid"]
+        )
+        remote = _connect_public(host, port)
+        write_lock = threading.Lock()
+        finished = threading.Event()
+
+        def send_binary(data: bytes) -> None:
+            with write_lock:
+                conn.sendall(_ws_frame(data))
+
+        def relay_back() -> None:
+            try:
+                while not finished.is_set():
+                    data = remote.recv(64 * 1024)
+                    if not data:
+                        return
+                    send_binary(data)
+            except OSError:
+                return
+            finally:
+                finished.set()
+                with contextlib.suppress(OSError):
+                    conn.shutdown(socket.SHUT_RDWR)
+
+        try:
+            send_binary(bytes([version, 0]))
+            if payload:
+                remote.sendall(payload)
+            threading.Thread(
+                target=relay_back,
+                name="bot-hosting-ws-upstream",
+                daemon=True,
+            ).start()
+            while not finished.is_set():
+                message = _read_ws_message(conn)
+                if message is None:
+                    break
+                if message:
+                    remote.sendall(message)
+        finally:
+            finished.set()
+            with contextlib.suppress(OSError):
+                remote.close()
 
     @staticmethod
     def _http_reply(

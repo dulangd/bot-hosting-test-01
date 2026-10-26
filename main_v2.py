@@ -5,7 +5,7 @@ The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
 - the existing endpoint client identities are preserved; the historical default identity is not replaced;
 - additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
-- one stable individual subscription URL containing the three baseline REALITY endpoints and the optional CF Tunnel endpoint;
+- one stable individual subscription URL containing the three baseline REALITY endpoints and an optional validated VLESS/WS endpoint;
 - rust-reality owns the one public TCP port directly; subscription/proof HTTP uses its loopback cover fallback;
 - shared physical-instance traffic ownership with no triple counting.
 """
@@ -24,15 +24,16 @@ import time
 from pathlib import Path
 
 import bot_hosting_core as core
-from bot_hosting_cf import CloudflareRuntime, prepare_cf_endpoint, start_cf_runtime
 from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
+    build_ws_endpoint,
     ensure_endpoint_clients,
     registry_proofs,
     start_agent,
     subscription_token,
     verified_country,
+    ws_public_selftest,
 )
 
 CLIENT_LINKS = core.STATE_DIR / "client-links.txt"
@@ -146,15 +147,9 @@ def wait_public_ready(process: subprocess.Popen, public_port: int, timeout: floa
 def supervise_process(
     process: subprocess.Popen,
     mux: SubscriptionMux,
-    cf_runtime: CloudflareRuntime | None = None,
 ) -> int:
-    def close_sidecars() -> None:
-        mux.close()
-        if cf_runtime is not None:
-            cf_runtime.close()
-
     def forward_signal(signum: int, _frame: object) -> None:
-        close_sidecars()
+        mux.close()
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 process.send_signal(signum)
@@ -166,7 +161,7 @@ def supervise_process(
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
-        close_sidecars()
+        mux.close()
         if process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()
@@ -215,46 +210,18 @@ def run() -> None:
                 f"missing={missing or 'unknown'}; refusing to start with a reduced node set"
             )
 
-        cf_runtime: CloudflareRuntime | None = None
-        try:
-            cf_prepared = prepare_cf_endpoint(core.STATE_DIR, country)
-            if cf_prepared is None:
-                core.log(
-                    "CF endpoint disabled: CF_TUNNEL_TOKEN/CF_TUNNEL_HOSTNAME "
-                    "are not both configured"
-                )
-            else:
-                cf_ep, cf_identity = cf_prepared
-                cf_proofs = registry_proofs(core.STATE_DIR, endpoints + [cf_ep])
-                cf_runtime = start_cf_runtime(
-                    core.STATE_DIR,
-                    cf_identity,
-                    cf_proofs[cf_ep["node_id"]],
-                    cf_ep["host"],
-                )
-                endpoints.append(cf_ep)
-                core.log(
-                    f"CF endpoint activated: {cf_ep['name']}="
-                    f"{cf_ep['host']}:{cf_ep['port']} origin=127.0.0.1:25903"
-                )
-        except Exception as exc:
-            if cf_runtime is not None:
-                with contextlib.suppress(Exception):
-                    cf_runtime.close()
-            cf_runtime = None
-            core.log(
-                "CF endpoint not activated; existing 3 REALITY endpoints "
-                f"preserved: {type(exc).__name__}: {exc}"
-            )
+        ws_ep, ws_identity = build_ws_endpoint(
+            core.STATE_DIR, host, port, country
+        )
+        core.log(
+            f"WS candidate prepared: {ws_ep['name']}="
+            f"{ws_ep['host']}:{ws_ep['port']} path_configured=true"
+        )
 
         default_ep = next(
             ep for ep in endpoints if ep["kind"] == "default"
         )
         core.atomic_write(core.CLIENT_LINK, (default_ep["uri"] + "\n").encode())
-        core.atomic_write(
-            CLIENT_LINKS,
-            ("\n".join(ep["uri"] for ep in endpoints) + "\n").encode(),
-        )
 
         # Totals are persisted in traffic.json; do not replay old completion events.
         for old_log in core.STATE_DIR.glob("traffic-events.log*"):
@@ -271,12 +238,8 @@ def run() -> None:
         # Railway verifies Bot-Hosting country from the direct-IP record. Register
         # that record first so Default and Custom can inherit the same independent
         # Railway-side check during the very first registration pass.
-        registry_endpoints = sorted(
-            endpoints,
-            key=lambda ep: {"ip": 0, "default": 1, "custom": 2, "cf": 3}.get(ep["kind"], 9),
-        )
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
-        proofs = registry_proofs(core.STATE_DIR, endpoints)
+        proofs = registry_proofs(core.STATE_DIR, endpoints + [ws_ep])
         dispatcher_port = pick_dispatcher_port(port)
         prepare_runtime_config(config, port, dispatcher_port)
         mux = SubscriptionMux(
@@ -288,6 +251,7 @@ def run() -> None:
             geo=geo,
             cover_host=str(meta["sni"]),
             cover_port=443,
+            ws_identity=ws_identity,
         )
 
         environment = os.environ.copy()
@@ -301,14 +265,37 @@ def run() -> None:
             wait_public_ready(process, port)
         except Exception:
             mux.close()
-            if cf_runtime is not None:
-                with contextlib.suppress(Exception):
-                    cf_runtime.close()
             with contextlib.suppress(Exception):
                 if "process" in locals() and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=3)
             raise
+
+        try:
+            ws_public_selftest(port, host, ws_identity)
+        except Exception as exc:
+            core.log(
+                "WS endpoint not activated; existing 3 REALITY endpoints "
+                f"preserved: {type(exc).__name__}: {exc}"
+            )
+        else:
+            endpoints.append(ws_ep)
+            mux.set_endpoints(endpoints)
+            core.log(
+                f"WS endpoint activated: {ws_ep['name']}="
+                f"{ws_ep['host']}:{ws_ep['port']} transport=ws tls=off"
+            )
+
+        core.atomic_write(
+            CLIENT_LINKS,
+            ("\n".join(ep["uri"] for ep in endpoints) + "\n").encode(),
+        )
+        registry_endpoints = sorted(
+            endpoints,
+            key=lambda ep: {
+                "ip": 0, "default": 1, "custom": 2, "ws": 3
+            }.get(ep["kind"], 9),
+        )
 
         agent_pid = start_agent(
             core.STATE_DIR,
@@ -337,8 +324,8 @@ def run() -> None:
         print(mux.url)
         print()
         contains = "default + direct-IP + custom-domain"
-        if any(ep["kind"] == "cf" for ep in endpoints):
-            contains += " + CF-Tunnel"
+        if any(ep["kind"] == "ws" for ep in endpoints):
+            contains += " + WebSocket"
         print(f"Contains: {contains}")
         print("=" * 78)
         print()
@@ -363,7 +350,7 @@ def run() -> None:
         sys.stdout.flush()
         sys.stderr.flush()
 
-        return_code = supervise_process(process, mux, cf_runtime)
+        return_code = supervise_process(process, mux)
         raise SystemExit(return_code if return_code >= 0 else 1)
 
 
