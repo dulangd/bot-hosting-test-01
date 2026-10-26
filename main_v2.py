@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import bot_hosting_core as core
@@ -121,9 +122,9 @@ def start_runtime(binary: Path, runtime_config: Path, environment: dict[str, str
 
 
 def wait_backend_ready(process: subprocess.Popen, backend_port: int, timeout: float = 8.0) -> None:
-    deadline = core.time.monotonic() + timeout
+    deadline = time.monotonic() + timeout
     last_error: Exception | None = None
-    while core.time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         if process.poll() is not None:
             raise core.BootstrapError(
                 f"rust-reality exited before backend became ready rc={process.returncode}"
@@ -134,7 +135,7 @@ def wait_backend_ready(process: subprocess.Popen, backend_port: int, timeout: fl
             return
         except OSError as exc:
             last_error = exc
-            core.time.sleep(0.05)
+            time.sleep(0.05)
     raise core.BootstrapError(
         f"rust-reality backend 127.0.0.1:{backend_port} did not become ready: {last_error}"
     )
