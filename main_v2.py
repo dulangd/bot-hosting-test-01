@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import bot_hosting_core as core
@@ -100,20 +101,47 @@ def prepare_runtime_config(config: dict, public_port: int) -> int:
     runtime_port = pick_backend_port(public_port)
     runtime = json.loads(json.dumps(config))
     runtime["inbounds"][0]["port"] = runtime_port
+    runtime["inbounds"][0]["listen"] = {
+        "mode": "ipv4Only",
+        "ipv4": "127.0.0.1",
+    }
     data = (json.dumps(runtime, ensure_ascii=False, indent=2) + "\n").encode()
     core.atomic_write(RUNTIME_CONFIG, data)
     core.validate_config_file(RUNTIME_CONFIG, self_test=False)
     return runtime_port
 
 
-def supervise_runtime(binary: Path, runtime_config: Path, environment: dict[str, str], mux: SubscriptionMux) -> int:
-    process = subprocess.Popen(
+def start_runtime(binary: Path, runtime_config: Path, environment: dict[str, str]) -> subprocess.Popen:
+    return subprocess.Popen(
         [str(binary), "serve", "--config", str(runtime_config)],
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
         env=environment,
     )
+
+
+def wait_backend_ready(process: subprocess.Popen, backend_port: int, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise core.BootstrapError(
+                f"rust-reality exited before backend became ready rc={process.returncode}"
+            )
+        try:
+            probe = socket.create_connection(("127.0.0.1", backend_port), timeout=0.5)
+            probe.close()
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise core.BootstrapError(
+        f"rust-reality backend 127.0.0.1:{backend_port} did not become ready: {last_error}"
+    )
+
+
+def supervise_process(process: subprocess.Popen, mux: SubscriptionMux) -> int:
     def forward_signal(signum: int, _frame: object) -> None:
         mux.close()
         if process.poll() is None:
@@ -215,7 +243,19 @@ def run() -> None:
             proofs=proofs,
             geo=geo,
         )
-        mux.start()
+
+        environment = os.environ.copy()
+        environment.setdefault("RUST_BACKTRACE", "0")
+        process = start_runtime(core.BINARY, RUNTIME_CONFIG, environment)
+        try:
+            wait_backend_ready(process, backend_port)
+            mux.start()
+        except Exception:
+            with contextlib.suppress(Exception):
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=3)
+            raise
 
         agent_pid = start_agent(
             core.STATE_DIR,
@@ -260,23 +300,15 @@ def run() -> None:
             for ep in endpoints:
                 print(ep["uri"], flush=True)
 
-        environment = os.environ.copy()
-        environment.setdefault("RUST_BACKTRACE", "0")
         core.log(
-            f"start rust-reality backend=127.0.0.1:{backend_port}; "
-            "public port is owned by the single-port subscription/REALITY mux"
+            f"rust-reality backend ready=127.0.0.1:{backend_port}; "
+            "public port=25901 mux ready"
         )
         sys.stdout.flush()
         sys.stderr.flush()
 
-        return_code = supervise_runtime(
-            core.BINARY,
-            RUNTIME_CONFIG,
-            environment,
-            mux,
-        )
-        raise SystemExit(return_code if return_code >= 0 else 1
-        )
+        return_code = supervise_process(process, mux)
+        raise SystemExit(return_code if return_code >= 0 else 1)
 
 
 if __name__ == "__main__":

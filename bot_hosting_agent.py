@@ -10,6 +10,7 @@ import os
 import secrets
 import select
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -540,19 +541,33 @@ class SubscriptionMux:
     def _handle(self, conn: socket.socket) -> None:
         try:
             conn.settimeout(5.0)
-            first = conn.recv(8, socket.MSG_PEEK)
-            if self._is_http_prefix(first):
-                self._handle_http(conn)
+            first = bytearray()
+            while len(first) < 8:
+                chunk = conn.recv(8 - len(first))
+                if not chunk:
+                    return
+                first.extend(chunk)
+                if first and first[0] not in b"GH":
+                    break
+                if len(first) >= 5 and (
+                    bytes(first).startswith(b"GET ")
+                    or bytes(first).startswith(b"HEAD ")
+                ):
+                    break
+
+            initial = bytes(first)
+            if self._is_http_prefix(initial):
+                self._handle_http(conn, initial)
             else:
-                self._handle_reality(conn)
-        except (OSError, ValueError):
-            pass
+                self._handle_reality(conn, initial)
+        except (OSError, ValueError) as exc:
+            print(f"[mux] connection error: {exc}", file=sys.stderr, flush=True)
         finally:
             with contextlib.suppress(OSError):
                 conn.close()
 
-    def _handle_http(self, conn: socket.socket) -> None:
-        request = bytearray()
+    def _handle_http(self, conn: socket.socket, initial: bytes = b"") -> None:
+        request = bytearray(initial)
         while b"\r\n\r\n" not in request and len(request) < 8192:
             chunk = conn.recv(2048)
             if not chunk:
@@ -642,16 +657,32 @@ class SubscriptionMux:
         if not head:
             conn.sendall(body)
 
-    def _handle_reality(self, client: socket.socket) -> None:
-        backend = socket.create_connection(
-            ("127.0.0.1", self.backend_port),
-            timeout=8.0,
-        )
+    def _handle_reality(self, client: socket.socket, initial: bytes = b"") -> None:
+        deadline = time.monotonic() + 5.0
+        backend = None
+        last_error = None
+        while backend is None and time.monotonic() < deadline:
+            try:
+                backend = socket.create_connection(
+                    ("127.0.0.1", self.backend_port),
+                    timeout=1.0,
+                )
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.05)
+        if backend is None:
+            raise OSError(
+                f"REALITY backend 127.0.0.1:{self.backend_port} unavailable: {last_error}"
+            )
+
         backend.settimeout(None)
         client.settimeout(None)
+        if initial:
+            backend.sendall(initial)
+
         sockets = [client, backend]
         try:
-            while sockets and not self._stop.is_set():
+            while not self._stop.is_set():
                 readable, _writable, exceptional = select.select(
                     sockets, [], sockets, 60.0
                 )
@@ -662,6 +693,9 @@ class SubscriptionMux:
                 for src in readable:
                     data = src.recv(64 * 1024)
                     if not data:
+                        peer = backend if src is client else client
+                        with contextlib.suppress(OSError):
+                            peer.shutdown(socket.SHUT_WR)
                         return
                     dst = backend if src is client else client
                     dst.sendall(data)
