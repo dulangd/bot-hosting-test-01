@@ -29,11 +29,13 @@ NODE_IDS = {
     "default": "bot-hosting-01",
     "ip": "bot-hosting-ip-01",
     "custom": "bot-hosting-domain-01",
+    "cf": "bot-hosting-cf-01",
 }
 BASE_NAMES = {
     "default": "BotHosting-Default-01",
     "ip": "BotHosting-IP-01",
     "custom": "BotHosting-Custom-01",
+    "cf": "BotHosting-CF-01",
 }
 
 
@@ -387,7 +389,9 @@ def _register(ep: dict, traffic: dict, proofs: dict[str, str]) -> int:
         return _http_json(base + "/api/v1/register", "POST", body, token)[0]
     body.pop("kind", None)
     body["proof"] = proofs[ep["node_id"]]
-    endpoint = os.environ.get("RR_REGISTRY_PROOF_ENDPOINT", "").strip()
+    endpoint = str(ep.get("proof_endpoint") or "").strip()
+    if not endpoint:
+        endpoint = os.environ.get("RR_REGISTRY_PROOF_ENDPOINT", "").strip()
     body["endpoint"] = endpoint or f"http://{_authority(ep['host'])}:{ep['port']}"
     body["metadata"] = {
         "egress_ip": str(os.environ.get("RR_GEO_IP", "")).strip(),
@@ -435,13 +439,14 @@ def subscription_token(state_dir: Path, stable_identity: str = "") -> str:
 
 def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
     by_kind = {ep["kind"]: ep for ep in endpoints}
-    missing = [kind for kind in ("default", "ip", "custom") if kind not in by_kind]
+    required = ("default", "ip", "custom", "cf")
+    missing = [kind for kind in required if kind not in by_kind]
     if missing:
         raise ValueError(
-            "subscription requires all 3 Bot-Hosting endpoints; missing "
+            "subscription requires all 4 Bot-Hosting endpoints; missing "
             + ",".join(missing)
         )
-    lines = [by_kind[kind]["uri"] for kind in ("default", "ip", "custom")]
+    lines = [by_kind[kind]["uri"] for kind in required]
     raw = "\n".join(lines) + "\n"
     return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
