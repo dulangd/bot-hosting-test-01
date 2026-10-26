@@ -501,8 +501,29 @@ class QuickTunnel:
             m = pattern.search(line)
             if m:
                 self.host = m.group(1).lower()
+                self._wait_public_ready(self.host, timeout=max(5.0, deadline - time.monotonic()))
                 return self.host
         raise RuntimeError(f"cloudflared quick tunnel timeout: {last}")
+
+    def _wait_public_ready(self, host: str, timeout: float = 25.0) -> None:
+        deadline = time.monotonic() + timeout
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(f"cloudflared exited rc={self.process.returncode} before public DNS ready")
+            try:
+                socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+                req = urllib.request.Request(
+                    f"https://{host}/health",
+                    headers={"User-Agent": "bot-hosting-cf-readiness/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if int(response.status) == 200:
+                        return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.5)
+        raise RuntimeError(f"Cloudflare quick tunnel public endpoint not ready: {last_error}")
 
     def close(self) -> None:
         proc, self.process = self.process, None
