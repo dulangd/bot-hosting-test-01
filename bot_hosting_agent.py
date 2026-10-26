@@ -451,13 +451,12 @@ def subscription_url(host: str, port: int, token: str) -> str:
 
 
 class SubscriptionMux:
-    """Serve one stable subscription URL on the existing public port.
+    """Internal cover dispatcher for rust-reality.
 
-    Bot-Hosting Free exposes one published port. HTTP GET/HEAD requests for
-    the subscription path are handled locally; non-HTTP traffic is passed
-    byte-for-byte to the loopback REALITY listener. Thus the existing VLESS
-    endpoint keeps the same host/port while one individual subscription URL
-    is added without requiring a second published port.
+    rust-reality owns the public SERVER_PORT directly. Its configured REALITY
+    cover target is this loopback dispatcher. Plain HTTP fallbacks are served
+    locally (subscription/proof/health); TLS fallbacks are relayed byte-for-byte
+    to the real cover host. No Python socket owns the public proxy port.
     """
 
     def __init__(
@@ -468,6 +467,8 @@ class SubscriptionMux:
         token: str,
         proofs: dict[str, str] | None = None,
         geo: dict[str, Any] | None = None,
+        cover_host: str = "",
+        cover_port: int = 443,
     ) -> None:
         self.public_port = int(public_port)
         self.backend_port = int(backend_port)
@@ -475,6 +476,12 @@ class SubscriptionMux:
         self.token = token
         self.proofs = proofs if isinstance(proofs, dict) else {}
         self.geo = geo if isinstance(geo, dict) else {}
+        self.cover_host = str(cover_host).strip()
+        self.cover_port = int(cover_port)
+        if not self.cover_host:
+            raise ValueError("cover_host is required")
+        if not 1 <= self.cover_port <= 65535:
+            raise ValueError("cover_port outside 1..65535")
         self.raw, self.encoded = subscription_content(endpoints)
         self._sock: socket.socket | None = None
         self._stop = threading.Event()
@@ -495,12 +502,12 @@ class SubscriptionMux:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.bind(("0.0.0.0", self.public_port))
+        sock.bind(("127.0.0.1", self.backend_port))
         sock.listen(128)
         self._sock = sock
         self._thread = threading.Thread(
             target=self._serve,
-            name="bot-hosting-subscription-mux",
+            name="bot-hosting-cover-dispatcher",
             daemon=True,
         )
         self._thread.start()
@@ -534,7 +541,7 @@ class SubscriptionMux:
             threading.Thread(
                 target=self._handle,
                 args=(conn,),
-                name="bot-hosting-mux-conn",
+                name="bot-hosting-cover-conn",
                 daemon=True,
             ).start()
 
@@ -561,7 +568,7 @@ class SubscriptionMux:
             else:
                 self._handle_reality(conn, initial)
         except (OSError, ValueError) as exc:
-            print(f"[mux] connection error: {exc}", file=sys.stderr, flush=True)
+            print(f"[cover] connection error: {exc}", file=sys.stderr, flush=True)
         finally:
             with contextlib.suppress(OSError):
                 conn.close()
@@ -616,6 +623,8 @@ class SubscriptionMux:
                     "service": "bot-hosting-local-mux",
                     "provider": "bot-hosting",
                     "proxy_backend": self.backend_port,
+                    "public_port": self.public_port,
+                    "cover_host": self.cover_host,
                     "endpoints": len(self.endpoints),
                     "geo": {
                         "country": str(self.geo.get("country", "XX")).upper(),
@@ -664,15 +673,15 @@ class SubscriptionMux:
         while backend is None and time.monotonic() < deadline:
             try:
                 backend = socket.create_connection(
-                    ("127.0.0.1", self.backend_port),
-                    timeout=1.0,
+                    (self.cover_host, self.cover_port),
+                    timeout=1.5,
                 )
             except OSError as exc:
                 last_error = exc
                 time.sleep(0.05)
         if backend is None:
             raise OSError(
-                f"REALITY backend 127.0.0.1:{self.backend_port} unavailable: {last_error}"
+                f"cover target {self.cover_host}:{self.cover_port} unavailable: {last_error}"
             )
 
         backend.settimeout(None)
