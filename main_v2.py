@@ -1,11 +1,11 @@
 """Bot-Hosting v2 entrypoint.
 
 The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
-- three independent Registry endpoint identities;
+- four independent Registry endpoint identities (3 REALITY + 1 Cloudflare WS);
 - the existing endpoint client identities are preserved; the historical default identity is not replaced;
 - additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
-- one stable individual subscription URL containing all three endpoints;
+- one stable individual subscription URL containing all four endpoints;
 - rust-reality owns the one public TCP port directly; subscription/proof HTTP uses its loopback cover fallback;
 - shared physical-instance traffic ownership with no triple counting.
 """
@@ -32,6 +32,13 @@ from bot_hosting_agent import (
     start_agent,
     subscription_token,
     verified_country,
+)
+from bot_hosting_cf import (
+    CloudflareWsServer,
+    QuickTunnel,
+    build_cf_endpoint,
+    load_identity as load_cf_identity,
+    pick_loopback_port as pick_cf_loopback_port,
 )
 
 CLIENT_LINKS = core.STATE_DIR / "client-links.txt"
@@ -142,9 +149,21 @@ def wait_public_ready(process: subprocess.Popen, public_port: int, timeout: floa
     )
 
 
-def supervise_process(process: subprocess.Popen, mux: SubscriptionMux) -> int:
+def supervise_process(
+    process: subprocess.Popen,
+    mux: SubscriptionMux,
+    extra_closers: tuple[object, ...] = (),
+) -> int:
+    def close_extras() -> None:
+        for item in extra_closers:
+            close = getattr(item, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+
     def forward_signal(signum: int, _frame: object) -> None:
         mux.close()
+        close_extras()
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 process.send_signal(signum)
@@ -157,6 +176,7 @@ def supervise_process(process: subprocess.Popen, mux: SubscriptionMux) -> int:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
         mux.close()
+        close_extras()
         if process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()
@@ -195,19 +215,43 @@ def run() -> None:
         country = str(geo.get("country", "XX")).upper()
         os.environ["RR_GEO_IP"] = str(geo.get("egress_ip", "")).strip()
         os.environ["RR_GEO_COUNTRY"] = country
-        endpoints = build_endpoints(config, meta, host, port, country)
-        required_kinds = {"default", "ip", "custom"}
+        base_endpoints = build_endpoints(config, meta, host, port, country)
+        base_required = {"default", "ip", "custom"}
+        base_kinds = {ep["kind"] for ep in base_endpoints}
+        if base_kinds != base_required:
+            missing = ",".join(sorted(base_required - base_kinds))
+            raise core.BootstrapError(
+                "Bot-Hosting requires the original 3 REALITY endpoints; "
+                f"missing={missing or 'unknown'}; refusing to reduce the working baseline"
+            )
+
+        dispatcher_port = pick_dispatcher_port(port)
+        cf_port = pick_cf_loopback_port({port, dispatcher_port})
+        cf_identity = load_cf_identity(core.STATE_DIR)
+        cf_server = CloudflareWsServer(cf_port, cf_identity, geo)
+        cf_tunnel = QuickTunnel(core.STATE_DIR, cf_port)
+        try:
+            cf_server.start()
+            cf_host = cf_tunnel.start()
+        except Exception:
+            cf_tunnel.close()
+            cf_server.close()
+            raise
+        cf_endpoint = build_cf_endpoint(cf_identity, cf_host, country)
+        endpoints = [*base_endpoints, cf_endpoint]
+
+        required_kinds = {"default", "ip", "custom", "cf"}
         actual_kinds = {ep["kind"] for ep in endpoints}
         if actual_kinds != required_kinds:
             missing = ",".join(sorted(required_kinds - actual_kinds))
+            cf_tunnel.close()
+            cf_server.close()
             raise core.BootstrapError(
-                "Bot-Hosting v2 requires all 3 endpoints; "
+                "Bot-Hosting requires all 4 endpoints; "
                 f"missing={missing or 'unknown'}; refusing to start with a reduced node set"
             )
 
-        default_ep = next(
-            ep for ep in endpoints if ep["kind"] == "default"
-        )
+        default_ep = next(ep for ep in endpoints if ep["kind"] == "default")
         core.atomic_write(core.CLIENT_LINK, (default_ep["uri"] + "\n").encode())
         core.atomic_write(
             CLIENT_LINKS,
@@ -231,11 +275,11 @@ def run() -> None:
         # Railway-side check during the very first registration pass.
         registry_endpoints = sorted(
             endpoints,
-            key=lambda ep: {"ip": 0, "default": 1, "custom": 2}.get(ep["kind"], 9),
+            key=lambda ep: {"ip": 0, "default": 1, "custom": 2, "cf": 3}.get(ep["kind"], 9),
         )
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
         proofs = registry_proofs(core.STATE_DIR, endpoints)
-        dispatcher_port = pick_dispatcher_port(port)
+        cf_server.set_proofs(proofs)
         prepare_runtime_config(config, port, dispatcher_port)
         mux = SubscriptionMux(
             public_port=port,
@@ -251,14 +295,15 @@ def run() -> None:
         environment = os.environ.copy()
         environment.setdefault("RUST_BACKTRACE", "0")
         try:
-            # Start the loopback cover/subscription dispatcher first. rust-reality
-            # then owns SERVER_PORT directly and uses this dispatcher only as its
-            # cover target for HTTP fallbacks and real TLS cover handshakes.
+            # The CF WS service/tunnel is already live. Start the loopback
+            # subscription/cover dispatcher, then let rust-reality own SERVER_PORT.
             mux.start()
             process = start_runtime(core.BINARY, RUNTIME_CONFIG, environment)
             wait_public_ready(process, port)
         except Exception:
             mux.close()
+            cf_tunnel.close()
+            cf_server.close()
             with contextlib.suppress(Exception):
                 if "process" in locals() and process.poll() is None:
                     process.terminate()
@@ -284,14 +329,14 @@ def run() -> None:
         )
         print()
         print("=" * 78)
-        print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (3 ENDPOINTS)")
+        print("BOT-HOSTING INDIVIDUAL SUBSCRIPTION (4 ENDPOINTS)")
         print("Same public port as the existing REALITY endpoint; independent of Railway Registry")
         print()
         print("COPY THIS SINGLE SUBSCRIPTION URL INTO v2rayN / Shadowrocket:")
         print()
         print(mux.url)
         print()
-        print("Contains exactly: default + direct-IP + custom-domain")
+        print("Contains exactly: default + direct-IP + custom-domain + CF-tunnel")
         print("=" * 78)
         print()
         core.log(
@@ -312,10 +357,14 @@ def run() -> None:
             f"rust-reality public listener ready=0.0.0.0:{port}; "
             f"cover/subscription dispatcher=127.0.0.1:{dispatcher_port}"
         )
+        core.log(
+            f"CF_TUNNEL_READY host={cf_host}:443 local_ws=127.0.0.1:{cf_port} "
+            f"node_id=bot-hosting-cf-01"
+        )
         sys.stdout.flush()
         sys.stderr.flush()
 
-        return_code = supervise_process(process, mux)
+        return_code = supervise_process(process, mux, (cf_tunnel, cf_server))
         raise SystemExit(return_code if return_code >= 0 else 1)
 
 
