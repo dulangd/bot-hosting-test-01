@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
+import bot_hosting_cf as cf
 import main_v2
 
 
@@ -104,7 +105,7 @@ def test_three_endpoint_links_and_names() -> None:
 
 
 
-def test_local_subscription_contains_all_three_endpoints() -> None:
+def test_local_subscription_contains_all_four_endpoints() -> None:
     cfg = fake_config()
     agent.ensure_endpoint_clients(cfg)
     original = agent.discover_hosts
@@ -122,15 +123,23 @@ def test_local_subscription_contains_all_three_endpoints() -> None:
     finally:
         agent.discover_hosts = original
 
+    eps.append(cf.build_cf_endpoint(
+        {"uuid": "44444444-4444-4444-8444-444444444444", "ws_path": "/ws-test"},
+        "unit-test.trycloudflare.com",
+        "FI",
+    ))
     raw, encoded = agent.subscription_content(eps)
     decoded = __import__("base64").b64decode(encoded).decode("utf-8")
     assert decoded == raw
     lines = [line for line in decoded.splitlines() if line]
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert all(line.startswith("vless://") for line in lines)
     assert "fi3.bot-hosting.net:25901" in lines[0]
     assert "65.108.103.151:25901" in lines[1]
     assert "bth.richd.cc.cd:25901" in lines[2]
+    assert "unit-test.trycloudflare.com:443" in lines[3]
+    assert "type=ws" in lines[3]
+    assert "security=tls" in lines[3]
 
     url = agent.subscription_url("fi3.bot-hosting.net", 25901, "stable-token")
     assert url == "http://fi3.bot-hosting.net:25901/sub64/stable-token"
@@ -170,6 +179,11 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
          "traffic_scope": "shared-instance", "traffic_owner": False},
         {"kind": "custom", "node_id": "bot-hosting-domain-01", "name": "FI-BotHosting-Custom-01",
          "host": "bth.richd.cc.cd", "port": 25901, "uri": "vless://default@bth.richd.cc.cd:25901?x=1",
+         "traffic_scope": "shared-instance", "traffic_owner": False},
+        {"kind": "cf", "node_id": "bot-hosting-cf-01", "name": "FI-BotHosting-CF-01",
+         "host": "unit-test.trycloudflare.com", "port": 443,
+         "uri": "vless://44444444-4444-4444-8444-444444444444@unit-test.trycloudflare.com:443?encryption=none&security=tls&type=ws&host=unit-test.trycloudflare.com&path=%2Fws-test",
+         "proof_endpoint": "https://unit-test.trycloudflare.com",
          "traffic_scope": "shared-instance", "traffic_owner": False},
     ]
 
@@ -230,7 +244,7 @@ def test_internal_dispatcher_serves_subscription_and_relays_cover() -> None:
         worker.join(timeout=2)
 
     assert agent.HEARTBEAT_DEFAULT >= 60
-    assert len({agent.NODE_IDS["default"], agent.NODE_IDS["ip"], agent.NODE_IDS["custom"]}) == 3
+    assert len({agent.NODE_IDS["default"], agent.NODE_IDS["ip"], agent.NODE_IDS["custom"], agent.NODE_IDS["cf"]}) == 4
 
 
 def test_runtime_config_keeps_reality_on_public_port() -> None:
@@ -253,6 +267,27 @@ def test_runtime_config_keeps_reality_on_public_port() -> None:
     assert inbound["streamSettings"]["realitySettings"]["target"] == "127.0.0.1:25902"
 
 
+
+def test_cf_endpoint_identity_and_uri_shape() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        one = cf.load_identity(Path(td))
+        two = cf.load_identity(Path(td))
+        assert one == two
+        ep = cf.build_cf_endpoint(one, "example.trycloudflare.com", "FI")
+        assert ep["kind"] == "cf"
+        assert ep["node_id"] == "bot-hosting-cf-01"
+        assert ep["name"] == "FI-BotHosting-CF-01"
+        assert ep["host"] == "example.trycloudflare.com"
+        assert ep["port"] == 443
+        assert ep["proof_endpoint"] == "https://example.trycloudflare.com"
+        assert f"vless://{one['uuid']}@" in ep["uri"]
+        assert "security=tls" in ep["uri"]
+        assert "type=ws" in ep["uri"]
+        assert "flow=" not in ep["uri"]
+        assert "sid=" not in ep["uri"]
+
+
+
 def test_private_bounded_log_shape() -> None:
     cfg = fake_config()
     old = os.environ.pop("RR_TRAFFIC_TRACKING", None)
@@ -271,9 +306,10 @@ def test_private_bounded_log_shape() -> None:
 if __name__ == "__main__":
     test_client_migration()
     test_three_endpoint_links_and_names()
-    test_local_subscription_contains_all_three_endpoints()
+    test_local_subscription_contains_all_four_endpoints()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()
+    test_cf_endpoint_identity_and_uri_shape()
     test_private_bounded_log_shape()
     print("PASS Bot-Hosting v2 isolated tests")
