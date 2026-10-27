@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import urllib.parse
 import threading
 import tempfile
 import time
