@@ -1023,7 +1023,32 @@ def maybe_migrate_existing_sni(config: dict, meta: dict) -> tuple[dict, dict]:
         return config, meta
 
     forced = os.environ.get("RR_SNI", "").strip()
-    if forced:
+
+    # A pre-migration RR_SNI pin may still name the old persisted SNI. Once
+    # the one-time migration has moved Amazon -> Microsoft, do not silently
+    # undo it on every restart; use RR_SNI_ROLLBACK=1 for an intentional revert.
+    if forced == AUTO_SNI_MIGRATION_FROM and current_sni == AUTO_SNI_MIGRATION_TO:
+        try:
+            previous = json.loads(SNI_ROLLBACK_FILE.read_text("utf-8"))
+        except Exception:
+            previous = {}
+        if (
+            previous.get("from_sni") == forced
+            and previous.get("to_sni") == current_sni
+        ):
+            log(
+                "ignoring stale RR_SNI matching the pre-migration SNI; "
+                "use RR_SNI_ROLLBACK=1 to restore it"
+            )
+            return config, meta
+
+    # If RR_SNI merely repeats the existing Amazon value, allow this requested
+    # one-time Amazon -> Microsoft candidate scan to run before honoring it as a pin.
+    same_as_current_for_first_scan = (
+        forced == current_sni == AUTO_SNI_MIGRATION_FROM
+        and not SNI_MIGRATION_FILE.exists()
+    )
+    if forced and not same_as_current_for_first_scan:
         report = {
             "version": 1,
             "attempted_at": int(time.time()),
