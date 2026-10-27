@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
+import bot_hosting_core as core
 import main_v2
 
 
@@ -38,6 +39,103 @@ def fake_config() -> dict:
         "outbounds": [{"protocol": "direct", "tag": "direct"}],
         "routing": {"rules": []},
     }
+
+
+def test_sni_candidate_probe_order() -> None:
+    expected = (
+        "www.microsoft.com",
+        "www.apple.com",
+        "www.cloudflare.com",
+        "www.amazon.com",
+        "www.ibm.com",
+        "www.nvidia.com",
+    )
+    assert core.DEFAULT_SNI_CANDIDATES == expected
+    calls = []
+    latency = {host: (index + 1) * 10 for index, host in enumerate(expected)}
+    original_probe = core.probe_sni_once
+    try:
+        core.probe_sni_once = lambda host: calls.append(host) or latency[host]
+        results = core.probe_sni_candidates()
+    finally:
+        core.probe_sni_once = original_probe
+    assert tuple(results) == expected
+    assert calls == [host for host in expected for _ in range(2)]
+    assert results["www.microsoft.com"] == 10
+
+
+def test_existing_node_sni_migration_is_one_shot_and_identity_safe() -> None:
+    cfg = fake_config()
+    reality = cfg["inbounds"][0]["streamSettings"]["realitySettings"]
+    reality["target"] = "www.amazon.com:443"
+    reality["serverNames"] = ["www.amazon.com"]
+    meta = {
+        "version": "1.6.1",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "shortId": "0123456789abcdef",
+        "publicKey": "PUBLIC_KEY_PLACEHOLDER",
+        "sni": "www.amazon.com",
+    }
+    expected_candidates = core.DEFAULT_SNI_CANDIDATES
+    original_values = {
+        name: getattr(core, name)
+        for name in (
+            "STATE_DIR", "CONFIG", "CLIENT_META",
+            "SNI_MIGRATION_FILE", "SNI_ROLLBACK_FILE",
+            "validate_config_file", "probe_sni_once",
+        )
+    }
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td)
+        config_path = state / "config.json"
+        meta_path = state / "client.json"
+        migration_path = state / "sni-migration-v1.json"
+        rollback_path = state / "sni-rollback.json"
+        config_path.write_text(json.dumps(cfg), "utf-8")
+        meta_path.write_text(json.dumps(meta), "utf-8")
+        calls = []
+        latency = {host: (index + 1) * 10 for index, host in enumerate(expected_candidates)}
+        try:
+            core.STATE_DIR = state
+            core.CONFIG = config_path
+            core.CLIENT_META = meta_path
+            core.SNI_MIGRATION_FILE = migration_path
+            core.SNI_ROLLBACK_FILE = rollback_path
+            core.validate_config_file = lambda *_args, **_kwargs: None
+            core.probe_sni_once = lambda host: calls.append(host) or latency[host]
+
+            migrated_meta = core.load_existing_node(25901)
+            migrated_config = json.loads(config_path.read_text("utf-8"))
+            assert migrated_meta["sni"] == "www.microsoft.com"
+            assert migrated_config["inbounds"][0]["streamSettings"]["realitySettings"]["target"] == "www.microsoft.com:443"
+            assert migrated_config["inbounds"][0]["streamSettings"]["realitySettings"]["serverNames"] == ["www.microsoft.com"]
+            assert migrated_meta["uuid"] == meta["uuid"]
+            assert migrated_meta["shortId"] == meta["shortId"]
+            assert migrated_meta["publicKey"] == meta["publicKey"]
+            assert migrated_config["inbounds"][0]["settings"]["clients"] == cfg["inbounds"][0]["settings"]["clients"]
+            assert calls[:12] == [host for host in expected_candidates for _ in range(2)]
+            assert calls[12] == "www.microsoft.com"
+            assert migration_path.exists() and rollback_path.exists()
+
+            calls.clear()
+            migrated_meta_again = core.load_existing_node(25901)
+            assert migrated_meta_again["sni"] == "www.microsoft.com"
+            assert calls == ["www.microsoft.com"]
+
+            restored_config, restored_meta = core._rollback_persisted_sni(
+                json.loads(config_path.read_text("utf-8")),
+                migrated_meta_again,
+            )
+            assert restored_meta["sni"] == "www.amazon.com"
+            restored_reality = restored_config["inbounds"][0]["streamSettings"]["realitySettings"]
+            assert restored_reality["target"] == "www.amazon.com:443"
+            assert restored_reality["serverNames"] == ["www.amazon.com"]
+            assert restored_meta["uuid"] == meta["uuid"]
+            assert restored_meta["shortId"] == meta["shortId"]
+            assert restored_meta["publicKey"] == meta["publicKey"]
+        finally:
+            for name, value in original_values.items():
+                setattr(core, name, value)
 
 
 def test_client_migration() -> None:
@@ -99,6 +197,7 @@ def test_three_endpoint_links_and_names() -> None:
     assert [x["name"] for x in eps] == [
         "FI-BotHosting-Default-01", "FI-BotHosting-IP-01", "FI-BotHosting-Custom-01"
     ]
+    assert all("sni=www.microsoft.com" in x["uri"] for x in eps)
     assert len({x["uri"].split("@", 1)[0] for x in eps}) == 3
     assert sum(1 for x in eps if x["traffic_owner"]) == 1
     assert next(x for x in eps if x["traffic_owner"])["kind"] == "default"
@@ -373,6 +472,7 @@ def test_runtime_config_keeps_reality_on_public_port() -> None:
     assert inbound["port"] == 25901
     assert inbound["listen"] == {"mode": "ipv4Only"}
     assert inbound["streamSettings"]["realitySettings"]["target"] == "127.0.0.1:25902"
+    assert inbound["streamSettings"]["realitySettings"]["serverNames"] == ["www.microsoft.com"]
 
 
 def test_private_bounded_log_shape() -> None:
@@ -391,6 +491,8 @@ def test_private_bounded_log_shape() -> None:
 
 
 if __name__ == "__main__":
+    test_sni_candidate_probe_order()
+    test_existing_node_sni_migration_is_one_shot_and_identity_safe()
     test_client_migration()
     test_three_endpoint_links_and_names()
     test_local_subscription_contains_all_three_endpoints()

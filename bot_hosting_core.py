@@ -22,7 +22,8 @@ Current deployment:
 Optional environment:
   RR_SERVER_ADDRESS=fi3.bot-hosting.net # override client link address
   RR_PORT=20202                      # override SERVER_PORT
-  RR_SNI=www.microsoft.com           # force one REALITY cover
+  RR_SNI=www.microsoft.com           # probe and safely migrate an existing node too
+  RR_SNI_ROLLBACK=1                  # restore the last SNI migration without regenerating identity
   RR_NODE_NAME=BotHosting-rust-reality # v2rayN display name
   RR_LOG_OUTPUT=stderr               # default: stderr in this diagnostic build
   RR_REGENERATE=1                    # explicitly discard old node identity
@@ -83,6 +84,10 @@ CONFIG = STATE_DIR / "config.json"
 CLIENT_META = STATE_DIR / "client.json"
 CLIENT_LINK = STATE_DIR / "client-link.txt"
 LOCK_FILE = STATE_DIR / ".bootstrap.lock"
+SNI_MIGRATION_FILE = STATE_DIR / "sni-migration-v1.json"
+SNI_ROLLBACK_FILE = STATE_DIR / "sni-rollback.json"
+AUTO_SNI_MIGRATION_FROM = "www.amazon.com"
+AUTO_SNI_MIGRATION_TO = "www.microsoft.com"
 
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 HTTP_TIMEOUT = 30
@@ -577,6 +582,33 @@ def probe_sni_once(sni: str) -> int | None:
         return None
 
 
+def probe_sni_candidates() -> dict[str, int | None]:
+    """Probe all original candidates without modifying persisted node identity."""
+    log("probing REALITY cover candidates")
+    results: dict[str, int | None] = {}
+
+    for sni in DEFAULT_SNI_CANDIDATES:
+        samples = [
+            value
+            for value in (
+                probe_sni_once(sni),
+                probe_sni_once(sni),
+            )
+            if value is not None
+        ]
+
+        if not samples:
+            results[sni] = None
+            log(f"  {sni}: incompatible/unreachable")
+            continue
+
+        latency = min(samples)
+        results[sni] = latency
+        log(f"  {sni}: {latency} ms")
+
+    return results
+
+
 def select_sni() -> str:
     forced = os.environ.get("RR_SNI", "").strip()
 
@@ -590,30 +622,12 @@ def select_sni() -> str:
         log(f"using forced REALITY SNI: {forced} ({latency} ms)")
         return forced
 
-    log("probing REALITY cover candidates")
-
-    results: list[tuple[int, str]] = []
-
-    for sni in DEFAULT_SNI_CANDIDATES:
-        # Two attempts reduce one-off DNS/TCP noise. We use the better
-        # successful result so one cgroup-throttled sample does not poison
-        # selection.
-        samples = [
-            value
-            for value in (
-                probe_sni_once(sni),
-                probe_sni_once(sni),
-            )
-            if value is not None
-        ]
-
-        if not samples:
-            log(f"  {sni}: incompatible/unreachable")
-            continue
-
-        latency = min(samples)
-        results.append((latency, sni))
-        log(f"  {sni}: {latency} ms")
+    candidate_results = probe_sni_candidates()
+    results = [
+        (latency, sni)
+        for sni, latency in candidate_results.items()
+        if latency is not None
+    ]
 
     if not results:
         raise BootstrapError(
@@ -820,9 +834,262 @@ def explicitly_regenerate_if_requested() -> None:
         CONFIG,
         CLIENT_META,
         CLIENT_LINK,
+        SNI_MIGRATION_FILE,
+        SNI_ROLLBACK_FILE,
     ):
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
+
+
+def _json_bytes(value: dict) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def _reality_settings(config: dict) -> dict:
+    try:
+        return config["inbounds"][0]["streamSettings"]["realitySettings"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BootstrapError(
+            "persisted configuration has no REALITY settings"
+        ) from exc
+
+
+def _validate_config_candidate(config: dict, *, self_test: bool) -> None:
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".sni-config.",
+        suffix=".json",
+        dir=STATE_DIR,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(_json_bytes(config))
+            stream.flush()
+            os.fsync(stream.fileno())
+        validate_config_file(tmp, self_test=self_test)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def _write_node_state(config: dict, meta: dict) -> None:
+    """Write config then metadata; restore both files if validation fails."""
+    old_config = CONFIG.read_bytes()
+    old_meta = CLIENT_META.read_bytes()
+    try:
+        atomic_write(CONFIG, _json_bytes(config))
+        atomic_write(CLIENT_META, _json_bytes(meta))
+        validate_config_file(CONFIG, self_test=False)
+    except Exception as exc:
+        restore_errors = []
+        for path, raw in ((CONFIG, old_config), (CLIENT_META, old_meta)):
+            try:
+                atomic_write(path, raw)
+            except Exception:
+                restore_errors.append(path.name)
+        if restore_errors:
+            raise BootstrapError(
+                "SNI state update failed and automatic restore failed for "
+                + ", ".join(restore_errors)
+            ) from exc
+        raise
+
+
+def _persist_sni_change(config: dict, meta: dict, new_sni: str) -> tuple[dict, dict]:
+    """Safely change only SNI-related fields while preserving node identity."""
+    if new_sni not in DEFAULT_SNI_CANDIDATES:
+        raise BootstrapError("SNI migration target is not in the validated candidate list")
+
+    old_sni = str(meta.get("sni", "")).strip()
+    if not old_sni:
+        raise BootstrapError("persisted client metadata has no SNI")
+    if new_sni == old_sni:
+        return config, meta
+
+    new_config = json.loads(json.dumps(config))
+    new_meta = json.loads(json.dumps(meta))
+    reality = _reality_settings(new_config)
+    old_target = reality.get("target")
+    old_names = reality.get("serverNames")
+    if (
+        not isinstance(old_target, str)
+        or old_target != f"{old_sni}:443"
+        or not isinstance(old_names, list)
+        or old_sni not in old_names
+    ):
+        raise BootstrapError(
+            "persisted REALITY target/serverNames do not match metadata; "
+            "refusing SNI migration"
+        )
+
+    backup = {
+        "version": 1,
+        "saved_at": int(time.time()),
+        "from_sni": old_sni,
+        "to_sni": new_sni,
+        "target": old_target,
+        "serverNames": old_names,
+    }
+    atomic_write(SNI_ROLLBACK_FILE, _json_bytes(backup))
+
+    reality["target"] = f"{new_sni}:443"
+    reality["serverNames"] = [new_sni]
+    new_meta["sni"] = new_sni
+
+    for field in ("uuid", "shortId", "publicKey"):
+        if new_meta.get(field) != meta.get(field):
+            raise BootstrapError("SNI migration attempted to alter node identity")
+    old_clients = json.dumps(
+        config["inbounds"][0]["settings"]["clients"], sort_keys=True
+    )
+    new_clients = json.dumps(
+        new_config["inbounds"][0]["settings"]["clients"], sort_keys=True
+    )
+    if old_clients != new_clients:
+        raise BootstrapError("SNI migration attempted to alter client identities")
+
+    _validate_config_candidate(new_config, self_test=True)
+    _write_node_state(new_config, new_meta)
+    log(
+        f"persisted REALITY SNI migrated: {old_sni} -> {new_sni}; "
+        "UUID, Short ID, public key and endpoint identities preserved"
+    )
+    return new_config, new_meta
+
+
+def _rollback_persisted_sni(config: dict, meta: dict) -> tuple[dict, dict]:
+    if not SNI_ROLLBACK_FILE.exists():
+        log("SNI rollback requested, but no saved SNI migration exists")
+        return config, meta
+
+    try:
+        backup = json.loads(SNI_ROLLBACK_FILE.read_text("utf-8"))
+    except Exception:
+        log("SNI rollback file is unreadable; persisted node state left unchanged")
+        return config, meta
+
+    if str(meta.get("sni", "")) != str(backup.get("to_sni", "")):
+        log("SNI rollback skipped; current SNI is not the last migrated target")
+        return config, meta
+
+    old_target = backup.get("target")
+    old_names = backup.get("serverNames")
+    old_sni = str(backup.get("from_sni", "")).strip()
+    if not isinstance(old_target, str) or not isinstance(old_names, list) or not old_sni:
+        log("SNI rollback data is incomplete; persisted node state left unchanged")
+        return config, meta
+
+    restored_config = json.loads(json.dumps(config))
+    restored_meta = json.loads(json.dumps(meta))
+    reality = _reality_settings(restored_config)
+    reality["target"] = old_target
+    reality["serverNames"] = old_names
+    restored_meta["sni"] = old_sni
+
+    _validate_config_candidate(restored_config, self_test=False)
+    _write_node_state(restored_config, restored_meta)
+    log(f"persisted REALITY SNI rolled back to {old_sni}; node identity preserved")
+    return restored_config, restored_meta
+
+
+def _record_sni_migration(report: dict) -> None:
+    try:
+        atomic_write(SNI_MIGRATION_FILE, _json_bytes(report))
+    except Exception as exc:
+        log(f"could not persist SNI migration report ({type(exc).__name__})")
+
+
+def maybe_migrate_existing_sni(config: dict, meta: dict) -> tuple[dict, dict]:
+    """Apply one probed SNI change to an existing node, without regenerating it."""
+    current_sni = str(meta.get("sni", "")).strip()
+
+    if os.environ.get("RR_SNI_ROLLBACK", "").strip() == "1":
+        report = {
+            "version": 1,
+            "attempted_at": int(time.time()),
+            "mode": "rollback",
+            "from_sni": current_sni,
+        }
+        try:
+            config, meta = _rollback_persisted_sni(config, meta)
+            report["outcome"] = (
+                "rolled-back" if str(meta.get("sni", "")) != current_sni
+                else "rollback-no-op"
+            )
+        except Exception as exc:
+            log(f"SNI rollback failed; current node state retained ({type(exc).__name__})")
+            report["outcome"] = "rollback-failed-current-state-retained"
+        _record_sni_migration(report)
+        return config, meta
+
+    forced = os.environ.get("RR_SNI", "").strip()
+    if forced:
+        report = {
+            "version": 1,
+            "attempted_at": int(time.time()),
+            "mode": "explicit",
+            "from_sni": current_sni,
+            "requested_sni": forced,
+        }
+        if forced not in DEFAULT_SNI_CANDIDATES:
+            log("existing-node RR_SNI ignored: choose one of the six validated candidates")
+            report["outcome"] = "rejected-not-in-candidate-list"
+        elif forced == current_sni:
+            log(f"RR_SNI already matches persisted REALITY SNI: {current_sni}")
+            report["outcome"] = "already-current"
+        else:
+            latency = probe_sni_once(forced)
+            report["probe_ms"] = latency
+            if latency is None:
+                log(f"requested REALITY SNI probe failed: {forced}; existing SNI retained")
+                report["outcome"] = "probe-failed-current-retained"
+            else:
+                try:
+                    config, meta = _persist_sni_change(config, meta, forced)
+                    report["outcome"] = "explicit-migration-applied"
+                except Exception as exc:
+                    log(
+                        f"requested REALITY SNI was not applied; existing state retained "
+                        f"({type(exc).__name__})"
+                    )
+                    report["outcome"] = "config-validation-failed-current-retained"
+        _record_sni_migration(report)
+        return config, meta
+
+    if SNI_MIGRATION_FILE.exists() or current_sni != AUTO_SNI_MIGRATION_FROM:
+        return config, meta
+
+    results = probe_sni_candidates()
+    report = {
+        "version": 1,
+        "attempted_at": int(time.time()),
+        "mode": "one-time-existing-node-test",
+        "from_sni": current_sni,
+        "requested_sni": AUTO_SNI_MIGRATION_TO,
+        "candidate_results_ms": results,
+    }
+    microsoft_latency = results.get(AUTO_SNI_MIGRATION_TO)
+    if microsoft_latency is None:
+        log(
+            f"{AUTO_SNI_MIGRATION_TO} did not pass probe-dest; "
+            f"keeping persisted SNI {current_sni}"
+        )
+        report["outcome"] = "candidate-probe-failed-current-retained"
+    else:
+        try:
+            config, meta = _persist_sni_change(
+                config, meta, AUTO_SNI_MIGRATION_TO
+            )
+            report["outcome"] = "migrated-to-microsoft"
+        except Exception as exc:
+            log(
+                f"{AUTO_SNI_MIGRATION_TO} passed probe-dest but migration validation "
+                f"failed; existing SNI retained ({type(exc).__name__})"
+            )
+            report["outcome"] = "config-validation-failed-current-retained"
+
+    _record_sni_migration(report)
+    return config, meta
 
 
 def load_existing_node(port: int) -> dict | None:
@@ -844,27 +1111,6 @@ def load_existing_node(port: int) -> dict | None:
             "Set RR_REGENERATE=1 once to rebuild it."
         ) from exc
 
-    # Reapply the current high-performance profile so an older bootstrap's
-    # persisted config cannot silently retain conservative settings.
-    config = apply_performance_profile(config, port)
-
-    config_data = (
-        json.dumps(
-            config,
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n"
-    ).encode()
-
-    atomic_write(CONFIG, config_data)
-
-    # Startup validation is cheap and catches stale/corrupt state.
-    validate_config_file(
-        CONFIG,
-        self_test=False,
-    )
-
     required_meta = {
         "uuid",
         "shortId",
@@ -876,6 +1122,27 @@ def load_existing_node(port: int) -> dict | None:
             "persisted client metadata is incomplete. "
             "Set RR_REGENERATE=1 once to rebuild it."
         )
+
+    persisted_sni = str(meta["sni"]).strip()
+    if not persisted_sni:
+        raise BootstrapError("persisted client metadata contains an empty SNI")
+
+    # Reapply the current profile, then reconcile the persisted server target
+    # and accepted serverNames with the client metadata before testing a change.
+    config = apply_performance_profile(config, port)
+    reality = _reality_settings(config)
+    if (
+        reality.get("target") != f"{persisted_sni}:443"
+        or reality.get("serverNames") != [persisted_sni]
+    ):
+        log("persisted REALITY target/serverNames differ from metadata; repairing alignment")
+        reality["target"] = f"{persisted_sni}:443"
+        reality["serverNames"] = [persisted_sni]
+
+    atomic_write(CONFIG, _json_bytes(config))
+    validate_config_file(CONFIG, self_test=False)
+
+    config, meta = maybe_migrate_existing_sni(config, meta)
 
     log("using persisted node identity")
     persisted_sni = str(meta["sni"])
