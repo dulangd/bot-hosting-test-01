@@ -414,6 +414,27 @@ def test_cloudflare_ws_endpoint_is_fifth_and_uses_tls() -> None:
                 os.environ[key] = value
 
 
+def test_vless_ws_rejects_non_tcp_command_with_diagnostic() -> None:
+    identity = "22222222-2222-4222-8222-222222222222"
+    for command, label in ((2, "udp"), (3, "mux")):
+        payload = (
+            bytes([0])
+            + __import__("uuid").UUID(identity).bytes
+            + bytes([0, command])
+            + b"\x00P"
+            + bytes([2, 11])
+            + b"example.com"
+        )
+        try:
+            agent._parse_vless_request(payload, identity)
+        except ValueError as exc:
+            message = str(exc)
+            assert f"command={command}" in message
+            assert label in message
+        else:
+            raise AssertionError("non-TCP VLESS command was unexpectedly accepted")
+
+
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "traffic.log"
@@ -572,6 +593,7 @@ if __name__ == "__main__":
     test_local_subscription_contains_all_three_endpoints()
     test_ws_endpoint_is_fourth_and_persistent()
     test_cloudflare_ws_endpoint_is_fifth_and_uses_tls()
+    test_vless_ws_rejects_non_tcp_command_with_diagnostic()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()

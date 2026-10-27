@@ -517,8 +517,13 @@ def _parse_vless_request(data: bytes, expected_uuid: str) -> tuple[int, str, int
     index += 1 + opt_len
     if index + 4 > len(data):
         raise ValueError("invalid VLESS request")
-    if data[index] != 1:
-        raise ValueError("only VLESS TCP CONNECT is supported")
+    command = data[index]
+    if command != 1:
+        label = {2: "udp", 3: "mux"}.get(command, "unknown")
+        raise ValueError(
+            f"unsupported VLESS command={command} ({label}); "
+            "WS fallback supports TCP CONNECT only"
+        )
     index += 1
     port = struct.unpack("!H", data[index:index + 2])[0]
     index += 2
@@ -929,8 +934,16 @@ class SubscriptionMux:
                 self._handle_http(conn, initial)
             else:
                 self._handle_reality(conn, initial)
-        except (OSError, EOFError, ValueError, UnicodeError) as exc:
-            print(f"[cover] connection error: {exc}", file=sys.stderr, flush=True)
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            # Public health probes, latency tests and clients closing before a
+            # complete fallback request are normal and should not look fatal.
+            return
+        except OSError as exc:
+            if getattr(exc, "errno", None) in {32, 54, 104}:
+                return
+            print(f"[cover] network issue: {exc}", file=sys.stderr, flush=True)
+        except (ValueError, UnicodeError) as exc:
+            print(f"[cover] protocol rejected: {exc}", file=sys.stderr, flush=True)
         finally:
             with contextlib.suppress(OSError):
                 conn.close()
