@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_core as core
+from bot_hosting_cf import CloudflareRuntime, prepare_cf_endpoint, start_cf_runtime
 from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
@@ -148,9 +149,15 @@ def wait_public_ready(process: subprocess.Popen, public_port: int, timeout: floa
 def supervise_process(
     process: subprocess.Popen,
     mux: SubscriptionMux,
+    cf_runtime: CloudflareRuntime | None = None,
 ) -> int:
-    def forward_signal(signum: int, _frame: object) -> None:
+    def close_sidecars() -> None:
         mux.close()
+        if cf_runtime is not None:
+            cf_runtime.close()
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        close_sidecars()
         if process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 process.send_signal(signum)
@@ -162,7 +169,7 @@ def supervise_process(
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
-        mux.close()
+        close_sidecars()
         if process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()
@@ -226,6 +233,43 @@ def run() -> None:
             f"{cf_ws_ep['host']}:443 tls=true path_reused=true"
         )
 
+        # Restore the separately configured Named Tunnel. Its origin remains
+        # isolated on 127.0.0.1:25903; it does not depend on public port 25901
+        # or the dynamic REALITY cover dispatcher on 25902.
+        cf_runtime: CloudflareRuntime | None = None
+        try:
+            cf_prepared = prepare_cf_endpoint(core.STATE_DIR, country)
+            if cf_prepared is None:
+                core.log(
+                    "CF Named Tunnel disabled: CF_TUNNEL_TOKEN/CF_TUNNEL_HOSTNAME "
+                    "are not both configured"
+                )
+            else:
+                cf_tunnel_ep, cf_identity = cf_prepared
+                cf_proofs = registry_proofs(
+                    core.STATE_DIR, endpoints + [cf_tunnel_ep]
+                )
+                cf_runtime = start_cf_runtime(
+                    core.STATE_DIR,
+                    cf_identity,
+                    cf_proofs[cf_tunnel_ep["node_id"]],
+                    cf_tunnel_ep["host"],
+                )
+                endpoints.append(cf_tunnel_ep)
+                core.log(
+                    f"CF Named Tunnel activated: {cf_tunnel_ep['name']}="
+                    f"{cf_tunnel_ep['host']}:443 origin=127.0.0.1:25903"
+                )
+        except Exception as exc:
+            if cf_runtime is not None:
+                with contextlib.suppress(Exception):
+                    cf_runtime.close()
+                cf_runtime = None
+            core.log(
+                "CF Named Tunnel not activated; other endpoints preserved: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
         default_ep = next(
             ep for ep in endpoints if ep["kind"] == "default"
         )
@@ -273,6 +317,9 @@ def run() -> None:
             wait_public_ready(process, port)
         except Exception:
             mux.close()
+            if cf_runtime is not None:
+                with contextlib.suppress(Exception):
+                    cf_runtime.close()
             with contextlib.suppress(Exception):
                 if "process" in locals() and process.poll() is None:
                     process.terminate()
@@ -306,7 +353,7 @@ def run() -> None:
         registry_endpoints = sorted(
             endpoints,
             key=lambda ep: {
-                "ip": 0, "default": 1, "custom": 2, "ws": 3, "cfws": 4
+                "ip": 0, "default": 1, "custom": 2, "ws": 3, "cfws": 4, "cf": 5
             }.get(ep["kind"], 9),
         )
 
@@ -341,6 +388,8 @@ def run() -> None:
             contains += " + WebSocket"
         if any(ep["kind"] == "cfws" for ep in endpoints):
             contains += " + Cloudflare-WebSocket"
+        if any(ep["kind"] == "cf" for ep in endpoints):
+            contains += " + Named-Cloudflare-Tunnel"
         print(f"Contains: {contains}")
         print("=" * 78)
         print()
@@ -365,7 +414,7 @@ def run() -> None:
         sys.stdout.flush()
         sys.stderr.flush()
 
-        return_code = supervise_process(process, mux)
+        return_code = supervise_process(process, mux, cf_runtime)
         raise SystemExit(return_code if return_code >= 0 else 1)
 
 
