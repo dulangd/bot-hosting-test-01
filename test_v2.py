@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import bot_hosting_agent as agent
+import bot_hosting_cf as cf
 import bot_hosting_core as core
 import main_v2
 
@@ -414,6 +415,58 @@ def test_cloudflare_ws_endpoint_is_fifth_and_uses_tls() -> None:
                 os.environ[key] = value
 
 
+
+def test_named_cloudflare_tunnel_endpoint_and_subscription() -> None:
+    keys = ("CF_TUNNEL_TOKEN", "CF_TUNNEL_HOSTNAME", "CF_ORIGIN_PORT")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ["CF_TUNNEL_TOKEN"] = "test-token-must-not-appear-in-links"
+        os.environ["CF_TUNNEL_HOSTNAME"] = "bth-cf.k1.us.ci"
+        os.environ["CF_ORIGIN_PORT"] = "25903"
+        with tempfile.TemporaryDirectory() as td:
+            endpoint, identity = cf.prepare_cf_endpoint(Path(td), "FI")
+            assert endpoint["kind"] == "cf"
+            assert endpoint["node_id"] == "bot-hosting-cf-01"
+            assert endpoint["host"] == "bth-cf.k1.us.ci"
+            assert endpoint["port"] == 443
+            assert endpoint["proof_endpoint"] == "https://bth-cf.k1.us.ci"
+            assert identity["uuid"]
+            assert identity["ws_path"].startswith("/")
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint["uri"]).query)
+            assert query["security"] == ["tls"]
+            assert query["type"] == ["ws"]
+            assert query["sni"] == ["bth-cf.k1.us.ci"]
+            assert query["host"] == ["bth-cf.k1.us.ci"]
+            assert "test-token-must-not-appear-in-links" not in endpoint["uri"]
+            assert cf.cf_origin_port() == 25903
+
+            baseline = [
+                {"kind": "default", "uri": "vless://default"},
+                {"kind": "ip", "uri": "vless://ip"},
+                {"kind": "custom", "uri": "vless://custom"},
+                {"kind": "ws", "uri": "vless://ws"},
+                {"kind": "cfws", "uri": "vless://cfws"},
+                endpoint,
+            ]
+            raw, encoded = agent.subscription_content(baseline)
+            decoded = __import__("base64").b64decode(encoded).decode("utf-8")
+            assert raw.splitlines() == decoded.splitlines()
+            assert decoded.splitlines() == [
+                "vless://default",
+                "vless://ip",
+                "vless://custom",
+                "vless://ws",
+                "vless://cfws",
+                endpoint["uri"],
+            ]
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "traffic.log"
@@ -572,6 +625,7 @@ if __name__ == "__main__":
     test_local_subscription_contains_all_three_endpoints()
     test_ws_endpoint_is_fourth_and_persistent()
     test_cloudflare_ws_endpoint_is_fifth_and_uses_tls()
+    test_named_cloudflare_tunnel_endpoint_and_subscription()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()
