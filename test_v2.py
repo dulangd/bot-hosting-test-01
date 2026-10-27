@@ -136,6 +136,8 @@ def test_existing_node_sni_migration_is_one_shot_and_identity_safe() -> None:
     }
     for name in original_env:
         os.environ.pop(name, None)
+    # Exercise the legacy case where RR_SNI still pins the persisted Amazon value.
+    os.environ["RR_SNI"] = "www.amazon.com"
 
     original_values = {
         name: getattr(core, name)
