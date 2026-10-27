@@ -64,6 +64,59 @@ def test_sni_candidate_probe_order() -> None:
     assert results["www.microsoft.com"] == 10
 
 
+
+def test_existing_node_keeps_sni_when_microsoft_probe_fails() -> None:
+    cfg = fake_config()
+    reality = cfg["inbounds"][0]["streamSettings"]["realitySettings"]
+    reality["target"] = "www.amazon.com:443"
+    reality["serverNames"] = ["www.amazon.com"]
+    meta = {
+        "version": "1.6.1",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "shortId": "0123456789abcdef",
+        "publicKey": "PUBLIC_KEY_PLACEHOLDER",
+        "sni": "www.amazon.com",
+    }
+    original_env = {
+        name: os.environ.get(name)
+        for name in ("RR_SNI", "RR_SNI_ROLLBACK")
+    }
+    original_values = {
+        name: getattr(core, name)
+        for name in ("SNI_MIGRATION_FILE", "SNI_ROLLBACK_FILE", "probe_sni_once")
+    }
+    for name in original_env:
+        os.environ.pop(name, None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            core.SNI_MIGRATION_FILE = Path(td) / "sni-migration-v1.json"
+            core.SNI_ROLLBACK_FILE = Path(td) / "sni-rollback.json"
+            calls = []
+
+            def fake_probe(host: str):
+                calls.append(host)
+                return None if host == "www.microsoft.com" else 20
+
+            core.probe_sni_once = fake_probe
+            returned_config, returned_meta = core.maybe_migrate_existing_sni(cfg, meta)
+            assert returned_meta["sni"] == "www.amazon.com"
+            returned_reality = returned_config["inbounds"][0]["streamSettings"]["realitySettings"]
+            assert returned_reality["target"] == "www.amazon.com:443"
+            assert returned_reality["serverNames"] == ["www.amazon.com"]
+            assert calls == [host for host in core.DEFAULT_SNI_CANDIDATES for _ in range(2)]
+            report = json.loads(core.SNI_MIGRATION_FILE.read_text("utf-8"))
+            assert report["outcome"] == "candidate-probe-failed-current-retained"
+            assert not core.SNI_ROLLBACK_FILE.exists()
+    finally:
+        for name, value in original_values.items():
+            setattr(core, name, value)
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_existing_node_sni_migration_is_one_shot_and_identity_safe() -> None:
     cfg = fake_config()
     reality = cfg["inbounds"][0]["streamSettings"]["realitySettings"]
@@ -510,6 +563,7 @@ def test_private_bounded_log_shape() -> None:
 
 if __name__ == "__main__":
     test_sni_candidate_probe_order()
+    test_existing_node_keeps_sni_when_microsoft_probe_fails()
     test_existing_node_sni_migration_is_one_shot_and_identity_safe()
     test_client_migration()
     test_three_endpoint_links_and_names()
