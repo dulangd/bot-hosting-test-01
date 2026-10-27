@@ -39,6 +39,9 @@ BASE_NAMES = {
 
 WS_NODE_ID = "bot-hosting-ws-01"
 WS_BASE_NAME = "BotHosting-WS-01"
+CF_WS_NODE_ID = "bot-hosting-cf-ws-01"
+CF_WS_BASE_NAME = "BotHosting-CF-WS-01"
+CF_WS_HOST_DEFAULT = "bth-ws-cf.k1.us.ci"
 WS_IDENTITY_FILE = "ws-identity.json"
 
 
@@ -388,6 +391,45 @@ def build_ws_endpoint(
         "proof_endpoint": f"http://{_authority(host)}:{int(port)}",
     }
     return endpoint, identity
+
+
+def build_cf_ws_endpoint(
+    identity: dict[str, str],
+    country: str,
+    origin_host: str,
+    origin_port: int,
+    cf_host: str = CF_WS_HOST_DEFAULT,
+) -> dict[str, Any]:
+    """Build the Cloudflare CDN WSS endpoint; origin proof stays on Bot-Hosting."""
+    host = str(cf_host).strip().lower().rstrip(".")
+    if not host or "/" in host or ":" in host:
+        raise ValueError("invalid Cloudflare WS hostname")
+    cc = country if len(country) == 2 else "XX"
+    name = f"{cc}-{CF_WS_BASE_NAME}"
+    query = urllib.parse.urlencode({
+        "encryption": "none",
+        "security": "tls",
+        "sni": host,
+        "type": "ws",
+        "path": identity["ws_path"],
+        "host": host,
+        "fp": "chrome",
+    })
+    return {
+        "kind": "cfws",
+        "node_id": CF_WS_NODE_ID,
+        "name": name,
+        "host": host,
+        "port": 443,
+        "uri": (
+            f"vless://{identity['uuid']}@{_authority(host)}:443"
+            f"?{query}#{urllib.parse.quote(name)}"
+        ),
+        "traffic_scope": "ws-fallback",
+        "traffic_owner": False,
+        "force_public_proof": True,
+        "proof_endpoint": f"http://{_authority(origin_host)}:{int(origin_port)}",
+    }
 
 
 def _recv_exact(sock: socket.socket, count: int) -> bytes:
@@ -753,6 +795,8 @@ def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
     order = ["default", "ip", "custom"]
     if "ws" in by_kind:
         order.append("ws")
+    if "cfws" in by_kind:
+        order.append("cfws")
     lines = [by_kind[kind]["uri"] for kind in order]
     raw = "\n".join(lines) + "\n"
     return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")

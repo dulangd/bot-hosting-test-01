@@ -187,6 +187,60 @@ def test_ws_endpoint_is_fourth_and_persistent() -> None:
 
 
 
+
+def test_cloudflare_ws_endpoint_is_fifth_and_uses_tls() -> None:
+    saved = {
+        key: os.environ.get(key)
+        for key in ("BOT_HOSTING_WS_UUID", "BOT_HOSTING_WS_PATH")
+    }
+    try:
+        os.environ.pop("BOT_HOSTING_WS_UUID", None)
+        os.environ.pop("BOT_HOSTING_WS_PATH", None)
+        with tempfile.TemporaryDirectory() as td:
+            direct, identity = agent.build_ws_endpoint(
+                Path(td), "fi3.bot-hosting.net", 25901, "FI"
+            )
+            cf = agent.build_cf_ws_endpoint(
+                identity, "FI", "fi3.bot-hosting.net", 25901
+            )
+            assert cf["kind"] == "cfws"
+            assert cf["node_id"] == "bot-hosting-cf-ws-01"
+            assert cf["name"] == "FI-BotHosting-CF-WS-01"
+            assert cf["host"] == "bth-ws-cf.k1.us.ci"
+            assert cf["port"] == 443
+            assert cf["force_public_proof"] is True
+            assert cf["proof_endpoint"] == "http://fi3.bot-hosting.net:25901"
+            assert direct["uri"].split("@", 1)[0] == cf["uri"].split("@", 1)[0]
+            assert "security=tls" in cf["uri"]
+            assert "type=ws" in cf["uri"]
+            assert "sni=bth-ws-cf.k1.us.ci" in cf["uri"]
+            assert "host=bth-ws-cf.k1.us.ci" in cf["uri"]
+            assert urllib.parse.urlsplit(cf["uri"]).port == 443
+
+            baseline = [
+                {"kind": "default", "uri": "vless://default"},
+                {"kind": "ip", "uri": "vless://ip"},
+                {"kind": "custom", "uri": "vless://custom"},
+                direct,
+                cf,
+            ]
+            raw, encoded = agent.subscription_content(baseline)
+            decoded = __import__("base64").b64decode(encoded).decode("utf-8")
+            assert decoded.splitlines() == [
+                "vless://default",
+                "vless://ip",
+                "vless://custom",
+                direct["uri"],
+                cf["uri"],
+            ]
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_completion_traffic_parser() -> None:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "traffic.log"
@@ -340,6 +394,7 @@ if __name__ == "__main__":
     test_three_endpoint_links_and_names()
     test_local_subscription_contains_all_three_endpoints()
     test_ws_endpoint_is_fourth_and_persistent()
+    test_cloudflare_ws_endpoint_is_fifth_and_uses_tls()
     test_completion_traffic_parser()
     test_internal_dispatcher_serves_subscription_and_relays_cover()
     test_runtime_config_keeps_reality_on_public_port()

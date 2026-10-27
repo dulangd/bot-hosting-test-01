@@ -5,7 +5,7 @@ The known-working ``main.py`` remains the bootstrap baseline. v2 adds:
 - the existing endpoint client identities are preserved; the historical default identity is not replaced;
 - additional endpoint client identities are stable and persisted once created;
 - independent endpoint heartbeat/re-registration;
-- one stable individual subscription URL containing the three baseline REALITY endpoints and an optional validated VLESS/WS endpoint;
+- one stable individual subscription URL containing three baseline REALITY endpoints, a direct VLESS/WS endpoint, and a Cloudflare TLS/WSS endpoint when the direct WS backend passes self-test;
 - rust-reality owns the one public TCP port directly; subscription/proof HTTP uses its loopback cover fallback;
 - shared physical-instance traffic ownership with no triple counting.
 """
@@ -28,6 +28,7 @@ from bot_hosting_agent import (
     SubscriptionMux,
     build_endpoints,
     build_ws_endpoint,
+    build_cf_ws_endpoint,
     ensure_endpoint_clients,
     registry_proofs,
     start_agent,
@@ -213,9 +214,16 @@ def run() -> None:
         ws_ep, ws_identity = build_ws_endpoint(
             core.STATE_DIR, host, port, country
         )
+        cf_ws_ep = build_cf_ws_endpoint(
+            ws_identity, country, host, port
+        )
         core.log(
             f"WS candidate prepared: {ws_ep['name']}="
             f"{ws_ep['host']}:{ws_ep['port']} path_configured=true"
+        )
+        core.log(
+            f"Cloudflare WS candidate prepared: {cf_ws_ep['name']}="
+            f"{cf_ws_ep['host']}:443 tls=true path_reused=true"
         )
 
         default_ep = next(
@@ -239,7 +247,7 @@ def run() -> None:
         # that record first so Default and Custom can inherit the same independent
         # Railway-side check during the very first registration pass.
         sub_token = subscription_token(core.STATE_DIR, str(meta["uuid"]))
-        proofs = registry_proofs(core.STATE_DIR, endpoints + [ws_ep])
+        proofs = registry_proofs(core.STATE_DIR, endpoints + [ws_ep, cf_ws_ep])
         dispatcher_port = pick_dispatcher_port(port)
         prepare_runtime_config(config, port, dispatcher_port)
         mux = SubscriptionMux(
@@ -280,10 +288,15 @@ def run() -> None:
             )
         else:
             endpoints.append(ws_ep)
+            endpoints.append(cf_ws_ep)
             mux.set_endpoints(endpoints)
             core.log(
                 f"WS endpoint activated: {ws_ep['name']}="
                 f"{ws_ep['host']}:{ws_ep['port']} transport=ws tls=off"
+            )
+            core.log(
+                f"Cloudflare WS endpoint activated: {cf_ws_ep['name']}="
+                f"{cf_ws_ep['host']}:443 transport=ws tls=on"
             )
 
         core.atomic_write(
@@ -293,7 +306,7 @@ def run() -> None:
         registry_endpoints = sorted(
             endpoints,
             key=lambda ep: {
-                "ip": 0, "default": 1, "custom": 2, "ws": 3
+                "ip": 0, "default": 1, "custom": 2, "ws": 3, "cfws": 4
             }.get(ep["kind"], 9),
         )
 
@@ -326,6 +339,8 @@ def run() -> None:
         contains = "default + direct-IP + custom-domain"
         if any(ep["kind"] == "ws" for ep in endpoints):
             contains += " + WebSocket"
+        if any(ep["kind"] == "cfws" for ep in endpoints):
+            contains += " + Cloudflare-WebSocket"
         print(f"Contains: {contains}")
         print("=" * 78)
         print()
