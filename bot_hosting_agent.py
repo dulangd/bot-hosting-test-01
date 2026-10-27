@@ -797,8 +797,6 @@ def subscription_content(endpoints: list[dict[str, Any]]) -> tuple[str, str]:
         order.append("ws")
     if "cfws" in by_kind:
         order.append("cfws")
-    if "cf" in by_kind:
-        order.append("cf")
     lines = [by_kind[kind]["uri"] for kind in order]
     raw = "\n".join(lines) + "\n"
     return raw, base64.b64encode(raw.encode("utf-8")).decode("ascii")
