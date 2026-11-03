@@ -938,9 +938,18 @@ class SubscriptionMux:
             # Public health probes, latency tests and clients closing before a
             # complete fallback request are normal and should not look fatal.
             return
+        except socket.timeout:
+            # A public probe/scanner can establish TCP and then send no
+            # fallback bytes (or an incomplete HTTP header) before the
+            # dispatcher's 5-second read deadline. This is an idle client,
+            # not a cover-host/network failure, so close it silently.
+            return
         except OSError as exc:
             if getattr(exc, "errno", None) in {32, 54, 104}:
                 return
+            # Real cover-upstream failures are raised by _handle_reality() with
+            # an explicit "cover target <host>:<port> unavailable" message and
+            # still reach this diagnostic path.
             print(f"[cover] network issue: {exc}", file=sys.stderr, flush=True)
         except (ValueError, UnicodeError) as exc:
             print(f"[cover] protocol rejected: {exc}", file=sys.stderr, flush=True)
